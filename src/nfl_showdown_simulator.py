@@ -1503,7 +1503,9 @@ class NFL_Showdown_Simulator:
             player_dict_values = {
                 v["UniqueKey"]: v for k, v in self.player_dict.items()
             }
-
+            cpt_player = None
+            flex_players = []
+            lu_names = []
             for player_id in lineup:
                 player_data = player_dict_values.get(player_id, {})
                 if player_data:
@@ -1511,27 +1513,41 @@ class NFL_Showdown_Simulator:
                         def_opps.append(player_data["Opp"])
                     if "CPT" in player_data["rosterPosition"]:
                         cpt_tm = player_data["Team"]
-
+                        cpt_player = player_id
+                    else:
+                        flex_players.append(player_id)
                     salary += player_data.get("Salary", 0)
                     fpts_p += player_data.get("Fpts", 0)
                     fieldFpts_p += player_data.get("fieldFpts", 0)
                     ceil_p += player_data.get("Ceiling", 0)
                     own_p.append(player_data.get("Ownership", 0) / 100)
                     own_s.append(player_data.get("Ownership", 0))
-                    if self.site == "fd" and "CPT" in player_data["rosterPosition"]:
-                        player_id = player_data.get("ID", "")
-                        if player_id.endswith("69696969"):
-                            player_id = player_id.replace("69696969", "")
-                        lu_names.append(f"{player_data.get('Name', '')} ({player_id})")
-                    else:
-                        lu_names.append(
-                            f"{player_data.get('Name', '').replace('#','-')} ({player_data.get('ID', '')})"
-                        )
                     lu_teams.append(player_data["Team"])
                     if "DST" not in player_data["Position"]:
                         if player_data["Team"] in def_opps:
                             players_vs_def += 1
-
+            
+            # Sort FLEX players based on their salary
+            flex_players.sort(key=lambda pid: player_dict_values[pid]["Salary"], reverse=True)
+            
+            # Reorder lineup with CPT first, then sorted FLEX players
+            sorted_lineup = ([cpt_player] if cpt_player else []) + flex_players
+            
+            # Create lu_names in the correct order
+            for player_id in sorted_lineup:
+                player_data = player_dict_values[player_id]
+                if self.site == "fd" and "CPT" in player_data["rosterPosition"]:
+                    player_id_str = player_data.get("ID", "")
+                    if player_id_str.endswith("69696969"):
+                        player_id_str = player_id_str.replace("69696969", "")
+                    lu_names.append(f"{player_data.get('Name', '')} ({player_id_str})")
+                else:
+                    lu_names.append(
+                        f"{player_data.get('Name', '').replace('#','-')} ({player_data.get('ID', '')})"
+                    )
+            
+            lineup = sorted_lineup
+            
             counter = collections.Counter(lu_teams)
             stacks = counter.most_common()
 
