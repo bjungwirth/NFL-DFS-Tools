@@ -14,15 +14,18 @@ import statistics
 import itertools
 import collections
 import re
-from scipy.stats import norm, kendalltau, multivariate_normal, gamma
+from scipy.stats import norm, kendalltau, multivariate_normal, gamma, lognorm
+from scipy.stats import truncnorm, truncexpon, gamma
 import matplotlib.pyplot as plt
 import seaborn as sns
-from numba import njit, jit
+from numba import jit
 import sys
 
-@jit(nopython=True)  
+
+@jit(nopython=True)  # nopython mode ensures the function is fully optimized
 def salary_boost(salary, max_salary):
     return (salary / max_salary) ** 2
+
 
 class NFL_Showdown_Simulator:
     config = None
@@ -523,96 +526,15 @@ class NFL_Showdown_Simulator:
                     ceil = fpts + stddev
                 if row["salary"]:
                     sal = float(row["salary"].replace(",", ""))
-                if pos == "QB":
-                    corr = {
-                        "QB": 1,
-                        "RB": 0.08,
-                        "WR": 0.62,
-                        "TE": 0.32,
-                        "K": -0.02,
-                        "DST": -0.09,
-                        "Opp QB": 0.24,
-                        "Opp RB": 0.04,
-                        "Opp WR": 0.19,
-                        "Opp TE": 0.1,
-                        "Opp K": -0.03,
-                        "Opp DST": -0.41,
-                    }
-                elif pos == "RB":
-                    corr = {
-                        "QB": 0.08,
-                        "RB": 1,
-                        "WR": -0.09,
-                        "TE": -0.02,
-                        "K": 0.16,
-                        "DST": 0.07,
-                        "Opp QB": 0.04,
-                        "Opp RB": -0.08,
-                        "Opp WR": 0.01,
-                        "Opp TE": 0.03,
-                        "Opp K": -0.13,
-                        "Opp DST": -0.33,
-                    }
-                elif pos == "WR":
-                    corr = {
-                        "QB": 0.62,
-                        "RB": -0.09,
-                        "WR": 1,
-                        "TE": -0.07,
-                        "K": 0.0,
-                        "DST": -0.08,
-                        "Opp QB": 0.19,
-                        "Opp RB": 0.01,
-                        "Opp WR": 0.16,
-                        "Opp TE": 0.08,
-                        "Opp K": 0.06,
-                        "Opp DST": -0.22,
-                    }
-                elif pos == "TE":
-                    corr = {
-                        "QB": 0.32,
-                        "RB": -0.02,
-                        "WR": -0.07,
-                        "TE": 1,
-                        "K": 0.02,
-                        "DST": -0.08,
-                        "Opp QB": 0.1,
-                        "Opp RB": 0.03,
-                        "Opp WR": 0.08,
-                        "Opp TE": 0,
-                        "Opp K": 0,
-                        "Opp DST": -0.14,
-                    }
-                elif pos == "K":
-                    corr = {
-                        "QB": -0.02,
-                        "RB": 0.16,
-                        "WR": 0,
-                        "TE": 0.02,
-                        "K": 1,
-                        "DST": 0.23,
-                        "Opp QB": -0.03,
-                        "Opp RB": -0.13,
-                        "Opp WR": 0.06,
-                        "Opp TE": 0,
-                        "Opp K": -0.04,
-                        "Opp DST": -0.32,
-                    }
-                elif pos == "DST":
-                    corr = {
-                        "QB": -0.09,
-                        "RB": 0.07,
-                        "WR": -0.08,
-                        "TE": -0.08,
-                        "K": 0.23,
-                        "DST": 1,
-                        "Opp QB": -0.41,
-                        "Opp RB": -0.33,
-                        "Opp WR": -0.22,
-                        "Opp TE": -0.14,
-                        "Opp K": -0.32,
-                        "Opp DST": -0.27,
-                    }
+                # Define the new correlation matrix
+                correlation_matrix = {
+                    "QB": {"QB": 1.00, "RB": 0.10, "WR": 0.36, "TE": 0.35, "K": -0.02, "DST": 0.04, "Opp QB": 0.23, "Opp RB": 0.07, "Opp WR": 0.12, "Opp TE": 0.10, "Opp K": -0.03, "Opp DST": -0.30},
+                    "RB": {"QB": 0.10, "RB": 1.00, "WR": 0.06, "TE": 0.03, "K": 0.16, "DST": 0.10, "Opp QB": 0.07, "Opp RB": -0.02, "Opp WR": 0.05, "Opp TE": 0.07, "Opp K": -0.13, "Opp DST": -0.21},
+                    "WR": {"QB": 0.36, "RB": 0.06, "WR": 1.00, "TE": 0.03, "K": 0.00, "DST": 0.06, "Opp QB": 0.12, "Opp RB": 0.05, "Opp WR": 0.05, "Opp TE": 0.06, "Opp K": 0.06, "Opp DST": -0.12},
+                    "TE": {"QB": 0.35, "RB": 0.03, "WR": 0.03, "TE": 1.00, "K": 0.02, "DST": 0.00, "Opp QB": 0.10, "Opp RB": 0.04, "Opp WR": 0.06, "Opp TE": 0.09, "Opp K": 0.00, "Opp DST": -0.03},
+                    "K": {"QB": -0.02, "RB": 0.16, "WR": 0.00, "TE": 0.02, "K": 1.00, "DST": 0.23, "Opp QB": -0.03, "Opp RB": -0.13, "Opp WR": 0.06, "Opp TE": 0.09, "Opp K": -0.04, "Opp DST": -0.32},
+                    "DST": {"QB": 0.04, "RB": 0.10, "WR": 0.06, "TE": 0.00, "K": 0.23, "DST": 1.00, "Opp QB": -0.30, "Opp RB": -0.21, "Opp WR": -0.12, "Opp TE": -0.03, "Opp K": -0.32, "Opp DST": -0.13},
+                }
                 team = row["team"]
                 if team == "LA":
                     team = "LAR"
@@ -632,6 +554,7 @@ class NFL_Showdown_Simulator:
                     cptOwn = own * 0.5
                 sal = int(row["salary"].replace(",", ""))
                 pos_str = "FLEX"
+                corr = correlation_matrix.get(pos, {})
                 player_data = {
                     "Fpts": fpts,
                     "fieldFpts": fieldFpts,
@@ -796,15 +719,13 @@ class NFL_Showdown_Simulator:
                 lu = lineup if self.site == "dk" else un_key_lu
                 if not error:
                     self.field_lineups[j] = {
-                        "Lineup": {
-                            "Lineup": lu,
-                            "Wins": 0,
-                            "Top10": 0,
-                            "ROI": 0,
-                            "Cashes": 0,
-                            "Type": "input",
-                        },
-                        "count": 1,
+                        "Lineup": lu,
+                        "Wins": 0,
+                        "Top1Percent": 0,
+                        "ROI": 0,
+                        "Cashes": 0,
+                        "Type": "input",
+                        "Count": 1,
                     }
                     j += 1
         print("loaded {} lineups".format(j))
@@ -985,10 +906,11 @@ class NFL_Showdown_Simulator:
                 lus[lu_num] = {
                     "Lineup": lineup,
                     "Wins": 0,
-                    "Top10": 0,
+                    "Top1Percent": 0,
                     "ROI": 0,
                     "Cashes": 0,
                     "Type": "generated",
+                    "Count": 0
                 }
                 break
         return lus
@@ -1164,7 +1086,7 @@ class NFL_Showdown_Simulator:
                 self.seen_lineups[lineup_set] += 1
 
                 # Increase the count in field_lineups using the index stored in seen_lineups_ix
-                self.field_lineups[self.seen_lineups_ix[lineup_set]]["count"] += 1
+                self.field_lineups[self.seen_lineups_ix[lineup_set]]["Count"] += 1
             else:
                 self.seen_lineups[lineup_set] = 1
 
@@ -1172,10 +1094,9 @@ class NFL_Showdown_Simulator:
                 if nk in self.field_lineups.keys():
                     print("bad lineups dict, please check dk_data files")
                 else:
-                    self.field_lineups[nk] = {
-                        "Lineup": next(iter(o.values())),
-                        "count": self.seen_lineups[lineup_set],
-                    }
+                    self.field_lineups[nk] = next(iter(o.values()))
+                    self.field_lineups[nk]['Lineup'] = lineup_set
+                    self.field_lineups[nk]['Count'] += self.seen_lineups[lineup_set]     
 
                     # Store the new nk in seen_lineups_ix for quick access in the future
                     self.seen_lineups_ix[lineup_set] = nk
@@ -1189,27 +1110,20 @@ class NFL_Showdown_Simulator:
     def run_simulation_for_game(self, team1_id, team1, team2_id, team2, num_iterations):
         def get_corr_value(player1, player2):
             # First, check for specific player-to-player correlations
-            if player2["Name"] in player1.get("Player Correlations", {}):
-                return player1["Player Correlations"][player2["Name"]]
+            if player2["ID"] in player1.get("Player Correlations", {}):
+                return player1["Player Correlations"][player2["ID"]]
 
             # If no specific correlation is found, proceed with the general logic
             position_correlations = {
                 "QB": -0.5,
-                "RB": -0.2,
-                "WR": -0.1,
-                "TE": -0.2,
+                "RB": -0.05,
+                "WR": 0.01,
+                "TE": 0.01,
                 "K": -0.5,
                 "DST": -0.5,
             }
 
-            if player1["Team"] == player2["Team"] and player1["Position"][0] in [
-                "QB",
-                "RB",
-                "WR",
-                "TE",
-                "K",
-                "DST",
-            ]:
+            if player1["Team"] == player2["Team"] and player1["Position"][0] == player2["Position"][0]:
                 primary_position = player1["Position"][0]
                 return position_correlations[primary_position]
 
@@ -1221,76 +1135,216 @@ class NFL_Showdown_Simulator:
             return player1["Correlations"].get(
                 player_2_pos, 0
             )  # Default to 0 if no correlation is found
+        
+        def generate_samples(player, num_iterations):
+            position = player['Position'][0]
+            projected_mean = player['Fpts']
+            projected_std = player['StdDev']
 
+            # Set the upper limit as a multiple of the standard deviation above the mean
+            upper_limit = projected_mean + 5 * projected_std
+
+            if position in ['WR', 'RB', 'TE']:
+                # Use truncated exponential distribution for skill positions
+                scale = projected_std
+                samples = truncexpon.rvs(b=upper_limit/scale, loc=0, scale=scale, size=num_iterations)
+                
+            elif position in ['QB', 'DST']:
+                # Use truncated normal distribution for QBs and DSTs
+                a, b = (0 - projected_mean) / projected_std, (upper_limit - projected_mean) / projected_std
+                samples = truncnorm.rvs(a, b, loc=projected_mean, scale=projected_std, size=num_iterations)
+            
+            elif position == 'K':
+                # Use gamma distribution for Kickers, but truncate at upper_limit
+                shape = (projected_mean / projected_std) ** 2
+                scale = projected_std ** 2 / projected_mean
+                samples = gamma.rvs(a=shape, scale=scale, size=num_iterations)
+                samples = np.minimum(samples, upper_limit)
+            
+            else:
+                raise ValueError(f"Unknown position: {position}")
+
+            # Ensure non-negative values and match the projected mean exactly
+            samples = np.maximum(samples, 0)
+            samples = (samples - np.mean(samples)) * (projected_std / np.std(samples)) + projected_mean
+
+            return samples
+        
         def build_covariance_matrix(players):
             N = len(players)
-            matrix = [[0 for _ in range(N)] for _ in range(N)]
             corr_matrix = [[0 for _ in range(N)] for _ in range(N)]
 
             for i in range(N):
                 for j in range(N):
                     if i == j:
-                        matrix[i][j] = (
-                            players[i]["StdDev"] ** 2
-                        )  # Variance on the diagonal
                         corr_matrix[i][j] = 1
                     else:
-                        matrix[i][j] = (
-                            get_corr_value(players[i], players[j])
-                            * players[i]["StdDev"]
-                            * players[j]["StdDev"]
-                        )
                         corr_matrix[i][j] = get_corr_value(players[i], players[j])
-            return matrix, corr_matrix
+            return np.array(corr_matrix)
 
-
-        def ensure_positive_semidefinite(matrix):
-            eigs = np.linalg.eigvals(matrix)
-            if np.any(eigs < 0):
-                jitter = abs(min(eigs)) + 1e-6  # a small value
-                matrix += np.eye(len(matrix)) * jitter
-
-            # Given eigenvalues and eigenvectors from previous code
-            eigenvalues, eigenvectors = np.linalg.eigh(matrix)
-
-            # Set negative eigenvalues to zero
-            eigenvalues[eigenvalues < 0] = 0
-
-            # Reconstruct the matrix
-            matrix = eigenvectors.dot(np.diag(eigenvalues)).dot(eigenvectors.T)
+        def ensure_positive_definite(matrix):
+            # Compute the eigenvalues
+            eigenvalues = np.linalg.eigvals(matrix)
+            
+            # If any eigenvalues are negative or close to zero, adjust them
+            if np.any(eigenvalues < 1e-8):
+                min_eig = np.min(eigenvalues)
+                matrix += (-min_eig + 1e-8) * np.eye(len(matrix))
+            
+            # Ensure symmetry
+            matrix = (matrix + matrix.T) / 2
+            
             return matrix
 
         # Filter out players with projections less than or equal to 0
-        team1 = [
-            player
-            for player in team1
-            if player["Fpts"] > 0 and player["rosterPosition"] == "FLEX"
-        ]
-        team2 = [
-            player
-            for player in team2
-            if player["Fpts"] > 0 and player["rosterPosition"] == "FLEX"
-        ]
+        team1 = [player for player in team1 if player['Fpts'] > 0]
+        team2 = [player for player in team2 if player['Fpts'] > 0]
 
         game = team1 + team2
-        covariance_matrix, corr_matrix = build_covariance_matrix(game)
-        covariance_matrix = ensure_positive_semidefinite(covariance_matrix)
+        corr_matrix = build_covariance_matrix(game)
 
+        # Ensure the correlation matrix is positive definite
+        corr_matrix = ensure_positive_definite(corr_matrix)
+
+        # Generate uncorrelated samples
+        uncorrelated_samples = np.array([generate_samples(player, num_iterations) for player in game])
+
+        # Apply correlation
         try:
-            samples = multivariate_normal.rvs(
-                mean=[player["Fpts"] for player in game],
-                cov=covariance_matrix,
-                size=num_iterations,
-            )
-        except Exception as e:
-            print(f"{team1_id}, {team2_id}, bad matrix: {str(e)}")
-            return {}
+            L = np.linalg.cholesky(corr_matrix)
+            correlated_samples = np.dot(L, uncorrelated_samples)
+        except np.linalg.LinAlgError:
+            print(f"Warning: Cholesky decomposition failed for {team1_id} vs {team2_id}. Using uncorrelated samples.")
+            correlated_samples = uncorrelated_samples
 
-        player_samples = [samples[:, i] for i in range(len(game))]
+        # Track trimming statistics
+        trim_stats = []
+
+        # Ensure means match projected values after correlation
+        for i, player in enumerate(game):
+            upper_limit = player['Fpts'] + 5 * player['StdDev']
+            
+            # Count how many samples are above the upper limit
+            samples_above_limit = np.sum(correlated_samples[i] > upper_limit)
+            
+            # Count how many samples are below zero
+            samples_below_zero = np.sum(correlated_samples[i] < 0)
+            
+            # Apply trimming
+            correlated_samples[i] = np.minimum(correlated_samples[i], upper_limit)
+            correlated_samples[i] = (correlated_samples[i] - np.mean(correlated_samples[i])) * (player['StdDev'] / np.std(correlated_samples[i])) + player['Fpts']
+            correlated_samples[i] = np.maximum(correlated_samples[i], 0)  # Ensure non-negative values
+            
+            # Store trimming statistics
+            trim_stats.append({
+                'Name': f"{player['Name']} ({player['Team']})",
+                'Position': player['Position'][0],
+                'Projected Mean': player['Fpts'],
+                'Projected StdDev': player['StdDev'],
+                'Samples Above Limit': samples_above_limit,
+                'Samples Below Zero': samples_below_zero,
+                'Percent Above Limit': (samples_above_limit / num_iterations) * 100,
+                'Percent Below Zero': (samples_below_zero / num_iterations) * 100
+            })
 
         temp_fpts_dict = {}
         for i, player in enumerate(game):
-            temp_fpts_dict[player["UniqueKey"]] = player_samples[i]
+            temp_fpts_dict[player["UniqueKey"]] = correlated_samples[i]
+
+        print(f"Starting to generate plots for {team1_id} vs {team2_id}")
+
+        # Ensure the 'simulation_plots' directory exists
+        os.makedirs('simulation_plots', exist_ok=True)
+        print(f"Created 'simulation_plots' directory")
+
+        # Plot distributions using KDE
+        plt.figure(figsize=(20, 10))
+        for i, player in enumerate(game):
+            sns.kdeplot(correlated_samples[i], label=f"{player['Name']} ({player['Team']})")
+
+        plt.title(f"Fantasy Point Distributions - {team1_id} vs {team2_id}")
+        plt.xlabel("Fantasy Points")
+        plt.ylabel("Density")
+        plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left', fontsize=8)
+        plt.tight_layout()
+        
+        distribution_plot_path = f'simulation_plots/{team1_id}_vs_{team2_id}_distributions.png'
+        plt.savefig(distribution_plot_path)
+        plt.close()
+        print(f"Saved distribution plot to {distribution_plot_path}")
+
+        # Plot default correlation matrix
+        plt.figure(figsize=(20, 18))
+        sns.heatmap(corr_matrix, annot=True, cmap='coolwarm', vmin=-1, vmax=1, 
+                    annot_kws={'size': 8}, fmt='.2f')
+        plt.title("Default Player Correlations")
+        
+        # Adjust labels for correlation matrix
+        player_labels = [f"{player['Name']} ({player['Team']})" for player in game]
+        plt.xticks(np.arange(len(player_labels)) + 0.5, player_labels, rotation=90, ha='right', fontsize=8)
+        plt.yticks(np.arange(len(player_labels)) + 0.5, player_labels, rotation=0, fontsize=8)
+
+        plt.tight_layout()
+        default_corr_plot_path = f'simulation_plots/{team1_id}_vs_{team2_id}_default_correlations.png'
+        plt.savefig(default_corr_plot_path, dpi=300, bbox_inches='tight')
+        plt.close()
+        print(f"Saved default correlation plot to {default_corr_plot_path}")
+
+        # Calculate and plot the correlation matrix of the correlated samples
+        sample_corr_matrix = np.corrcoef(correlated_samples)
+        
+        plt.figure(figsize=(20, 18))
+        sns.heatmap(sample_corr_matrix, annot=True, cmap='coolwarm', vmin=-1, vmax=1, 
+                    annot_kws={'size': 8}, fmt='.2f')
+        plt.title("Sampled Player Correlations")
+        
+        # Use the same player labels as before
+        plt.xticks(np.arange(len(player_labels)) + 0.5, player_labels, rotation=90, ha='right', fontsize=8)
+        plt.yticks(np.arange(len(player_labels)) + 0.5, player_labels, rotation=0, fontsize=8)
+
+        plt.tight_layout()
+        sample_corr_plot_path = f'simulation_plots/{team1_id}_vs_{team2_id}_sampled_correlations.png'
+        plt.savefig(sample_corr_plot_path, dpi=300, bbox_inches='tight')
+        plt.close()
+        print(f"Saved sampled correlation plot to {sample_corr_plot_path}")
+
+        # Create a dataframe with player statistics and trimming info
+        player_stats = []
+        for i, player in enumerate(game):
+            samples = correlated_samples[i]
+            stats = {
+                'Name': f"{player['Name']} ({player['Team']})",
+                'Position': player['Position'][0],
+                'Projected Mean': player['Fpts'],
+                'Projected StdDev': player['StdDev'],
+                'Sampled Mean': np.mean(samples),
+                'Sampled StdDev': np.std(samples),
+                'Sampled Median': np.median(samples),
+                'Sampled Min': np.min(samples),
+                'Sampled Max': np.max(samples),
+                'Percent Above Limit': trim_stats[i]['Percent Above Limit'],
+                'Percent Below Zero': trim_stats[i]['Percent Below Zero']
+            }
+            player_stats.append(stats)
+
+        stats_df = pd.DataFrame(player_stats)
+
+        # Plot the statistics table including trimming info
+        plt.figure(figsize=(20, len(game) * 0.5))
+        plt.axis('off')
+        table = plt.table(cellText=stats_df.values,
+                        colLabels=stats_df.columns,
+                        cellLoc='center',
+                        loc='center')
+        table.auto_set_font_size(False)
+        table.set_fontsize(8)
+        table.scale(1, 1.5)
+        plt.title("Player Statistics and Trimming Information", fontsize=16)
+        
+        stats_plot_path = f'simulation_plots/{team1_id}_vs_{team2_id}_player_stats_and_trimming.png'
+        plt.savefig(stats_plot_path, dpi=300, bbox_inches='tight')
+        plt.close()
+        print(f"Saved player statistics and trimming plot to {stats_plot_path}")
 
         return temp_fpts_dict
 
@@ -1359,7 +1413,7 @@ class NFL_Showdown_Simulator:
 
         # Validation on lineups
         for f in self.field_lineups:
-            if len(self.field_lineups[f]["Lineup"]["Lineup"]) != len(
+            if len(self.field_lineups[f]["Lineup"]) != len(
                 self.roster_construction
             ):
                 print("bad lineup", f, self.field_lineups[f])
@@ -1391,16 +1445,16 @@ class NFL_Showdown_Simulator:
         # print(payout_array)
         # print(self.player_dict[('patrick mahomes', 'FLEX', 'KC')])
         field_lineups_count = np.array(
-            [self.field_lineups[idx]["count"] for idx in self.field_lineups.keys()]
+            [self.field_lineups[idx]["Count"] for idx in self.field_lineups.keys()]
         )
 
         for index, values in self.field_lineups.items():
             try:
                 fpts_sim = sum(
-                    [temp_fpts_dict[player] for player in values["Lineup"]["Lineup"]]
+                    [temp_fpts_dict[player] for player in values["Lineup"]]
                 )
             except KeyError:
-                for player in values["Lineup"]["Lineup"]:
+                for player in values["Lineup"]:
                     if player not in temp_fpts_dict.keys():
                         print(player)
                         # for k,v in self.player_dict.items():
@@ -1426,12 +1480,6 @@ class NFL_Showdown_Simulator:
         payout_array = np.concatenate((payout_array, l_array))
         field_lineups_keys_array = np.array(list(self.field_lineups.keys()))
 
-        # Adjusted ROI calculation
-        # print(field_lineups_count.shape, payout_array.shape, ranks.shape, fpts_array.shape)
-
-        # Split the simulation indices into chunks
-        field_lineups_keys_array = np.array(list(self.field_lineups.keys()))
-
         chunk_size = self.num_iterations // 16  # Adjust chunk size as needed
         simulation_chunks = [
             (
@@ -1441,7 +1489,7 @@ class NFL_Showdown_Simulator:
                 field_lineups_keys_array,
                 self.use_contest_data,
                 field_lineups_count,
-            )  # Adding field_lineups_count here
+            )
             for i in range(0, self.num_iterations, chunk_size)
         ]
 
@@ -1454,19 +1502,17 @@ class NFL_Showdown_Simulator:
         index_to_key = list(self.field_lineups.keys())
         for idx, roi in enumerate(combined_result_array):
             lineup_key = index_to_key[idx]
-            lineup_count = self.field_lineups[lineup_key][
-                "count"
-            ]  # Assuming "Count" holds the count of the lineups
+            lineup_count = self.field_lineups[lineup_key]["Count"]
             total_sum += roi * lineup_count
-            self.field_lineups[lineup_key]["Lineup"]["ROI"] += roi
+            self.field_lineups[lineup_key]["ROI"] += roi
 
         for idx in self.field_lineups.keys():
             if idx in wins:
-                self.field_lineups[idx]["Lineup"]["Wins"] += win_counts[
+                self.field_lineups[idx]["Wins"] += win_counts[
                     np.where(wins == idx)
                 ][0]
             if idx in t10:
-                self.field_lineups[idx]["Lineup"]["Top10"] += t10_counts[
+                self.field_lineups[idx]["Top1Percent"] += t10_counts[
                     np.where(t10 == idx)
                 ][0]
 
@@ -1484,8 +1530,8 @@ class NFL_Showdown_Simulator:
         for index, data in self.field_lineups.items():
             # if index == 0:
             #    print(data)
-            lineup = data["Lineup"]["Lineup"]
-            lineup_data = data["Lineup"]
+            lineup = data["Lineup"]
+            lineup_data = data
             lu_type = lineup_data["Type"]
 
             salary = 0
@@ -1564,9 +1610,9 @@ class NFL_Showdown_Simulator:
             own_p = np.prod(own_p)
             own_s = np.sum(own_s)
             win_p = round(lineup_data["Wins"] / self.num_iterations * 100, 2)
-            top10_p = round(lineup_data["Top10"] / self.num_iterations * 100, 2)
+            top10_p = round(lineup_data["Top1Percent"] / self.num_iterations * 100, 2)
             cash_p = round(lineup_data["Cashes"] / self.num_iterations * 100, 2)
-            num_dupes = data["count"]
+            num_dupes = data["Count"]
             if self.use_contest_data:
                 roi_p = round(
                     lineup_data["ROI"] / self.entry_fee / self.num_iterations * 100, 2
@@ -1599,20 +1645,20 @@ class NFL_Showdown_Simulator:
             unique_players = {}
 
             for val in self.field_lineups.values():
-                lineup_data = val["Lineup"]
-                counts = val["count"]
+                lineup_data = val
+                counts = val["Count"]
                 for player_id in lineup_data["Lineup"]:
                     if player_id not in unique_players:
                         unique_players[player_id] = {
                             "Wins": lineup_data["Wins"],
-                            "Top10": lineup_data["Top10"],
-                            "In": val["count"],
+                            "Top10": lineup_data["Top1Percent"],
+                            "In": val["Count"],
                             "ROI": lineup_data["ROI"],
                         }
                     else:
                         unique_players[player_id]["Wins"] += lineup_data["Wins"]
-                        unique_players[player_id]["Top10"] += lineup_data["Top10"]
-                        unique_players[player_id]["In"] += val["count"]
+                        unique_players[player_id]["Top10"] += lineup_data["Top1Percent"]
+                        unique_players[player_id]["In"] += val["Count"]
                         unique_players[player_id]["ROI"] += lineup_data["ROI"]
 
             for player_id, data in unique_players.items():
@@ -1673,3 +1719,4 @@ class NFL_Showdown_Simulator:
                     for lineup_str, fpts in unique.items():
                         f.write(f"{lineup_str}\n")
         self.player_output()
+
