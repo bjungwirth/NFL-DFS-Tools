@@ -26,6 +26,23 @@ import sys
 def salary_boost(salary, max_salary):
     return (salary / max_salary) ** 2
 
+pos_own_corr = {
+    'QBDST1': 0.936, 'DSTDST0': 0.848, 'RBDST1': 0.835, 'WRDST1': 0.659, 'TEDST1': 0.551,
+    'RBK1': 0.517, 'QBK0': 0.511, 'DSTRB1': 0.469, 'QBK1': 0.46, 'WRK0': 0.434,
+    'RBK0': 0.405, 'WRK1': 0.381, 'TEK0': 0.261, 'QBWR1': 0.232, 'QBRB1': 0.196,
+    'DSTK1': 0.171, 'TEK1': 0.151, 'RBRB0': 0.134, 'DSTQB1': 0.109, 'KDST1': 0.099,
+    'TERB1': 0.082, 'KK0': 0.079, 'WRRB1': 0.065, 'DSTWR1': 0.061, 'KRB1': 0.057,
+    'TERB0': 0.046, 'WRRB0': 0.033, 'QBTE1': 0.017, 'WRTE1': 0.009, 'KQB1': 0.009,
+    'KWR1': 0.005, 'DSTDST1': 0, 'RBWR0': -0.001, 'TEWR0': -0.002, 'KK1': -0.009,
+    'KWR0': -0.013, 'KDST0': -0.018, 'WRWR0': -0.024, 'KRB0': -0.031, 'RBTE1': -0.035,
+    'TEWR1': -0.035, 'TETE0': -0.071, 'DSTTE1': -0.073, 'KTE1': -0.075, 'RBDST0': -0.097,
+    'QBRB0': -0.099, 'TEQB1': -0.115, 'RBTE0': -0.129, 'DSTRB0': -0.157, 'RBWR1': -0.159,
+    'WRTE0': -0.176, 'WRQB1': -0.209, 'WRDST0': -0.213, 'KQB0': -0.222, 'KTE0': -0.28,
+    'RBRB1': -0.287, 'DSTK0': -0.31, 'DSTWR0': -0.343, 'QBWR0': -0.344, 'WRWR1': -0.346,
+    'QBDST0': -0.348, 'TEDST0': -0.385, 'DSTTE0': -0.506, 'QBTE0': -0.532, 'RBQB1': -0.786,
+    'RBQB0': -0.91, 'TEQB0': -1.096, 'WRQB0': -1.134, 'DSTQB0': -1.367, 'QBQB0': -1.612,
+    'TETE1': -1.742, 'QBQB1': -3.946
+}
 
 class NFL_Showdown_Simulator:
     config = None
@@ -52,6 +69,7 @@ class NFL_Showdown_Simulator:
     max_pct_off_optimal = 0.4
     teams_dict = collections.defaultdict(list)  # Initialize teams_dict
     correlation_rules = {}
+    # Add this dictionary at the class level
 
     def __init__(
         self,
@@ -732,6 +750,31 @@ class NFL_Showdown_Simulator:
         # print(self.field_lineups)
 
     @staticmethod
+    def adjust_ownership(cpt_pos, flex_pos, cpt_team, flex_team, cpt_name, flex_name, cpt_own, flex_own, flex_salary):
+        # If the captain and flex are the same player (checking name, position, and team)
+        if cpt_name == flex_name and cpt_pos == flex_pos and cpt_team == flex_team:
+            return 0.0
+
+        same_team = 1 if cpt_team == flex_team else 0
+        position_team_code = cpt_pos + flex_pos + str(same_team)
+        
+        position_code = pos_own_corr.get(position_team_code, 0)
+        
+        # Convert ownership percentages to decimals
+        cpt_own_decimal = cpt_own / 100
+        flex_own_decimal = flex_own / 100
+        
+        flex_own_given_captain = 1 / (1 + math.exp(-(-3.795) - (0.858 * (flex_own_decimal * 10)) - (0.021 * (10 * cpt_own_decimal)) - (0.050 * (flex_salary / 1000)) - position_code))
+        
+        # Adjust the ownership to ensure the true probability matches expectation over 5 FLEX selections
+        adj_flex_own_decimal = 1 - ((1 - flex_own_given_captain) ** (1 / 5))
+        
+        # Convert back to percentage
+        adj_flex_own = adj_flex_own_decimal * 100
+        
+        return adj_flex_own
+
+    @staticmethod
     def select_player(
         pos,
         in_lineup,
@@ -821,22 +864,22 @@ class NFL_Showdown_Simulator:
         rng = np.random.Generator(np.random.PCG64())
         lus = {}
         in_lineup.fill(0)
-        iteration_count = 0
-        while True:
-            iteration_count += 1
+        max_iterations = 1000  # Set a maximum number of iterations to prevent infinite loops
+
+        for _ in range(max_iterations):
             salary, proj = 0, 0
             lineup, player_teams, lineup_matchups = [], [], []
             def_opp, players_opposing_def, cpt_selected = None, 0, False
             in_lineup.fill(0)
-            cpt_name = None
             remaining_salary = salary_ceiling
+            adjusted_ownership = ownership.copy()
 
             for k, pos in enumerate(pos_matrix.T):
                 position_constraint = k >= 1 and players_opposing_def < overlap_limit
                 choice_idx, choice = NFL_Showdown_Simulator.select_player(
                     pos,
                     in_lineup,
-                    ownership,
+                    adjusted_ownership if k > 0 else ownership,
                     ids,
                     salaries,
                     salary,
@@ -849,14 +892,8 @@ class NFL_Showdown_Simulator:
                     teams if position_constraint else None,
                 )
                 if choice is None:
-                    iteration_count += 1
-                    salary, proj = 0, 0
-                    lineup, player_teams, lineup_matchups = [], [], []
-                    def_opp, players_opposing_def, cpt_selected = None, 0, False
-                    in_lineup.fill(0)
-                    cpt_name = None
-                    remaining_salary = salary_ceiling
-                    continue
+                    break
+
                 if k == 0:
                     cpt_player_info = new_player_dict[choice]
                     flex_choice_idx = next(
@@ -874,13 +911,30 @@ class NFL_Showdown_Simulator:
                         in_lineup[flex_choice_idx] = 1
                     def_opp = opponents[choice_idx][0]
                     cpt_selected = True
+                    
+                    # Adjust ownership for FLEX players based on the selected captain
+                    cpt_pos = cpt_player_info['Position'][0]
+                    cpt_team = cpt_player_info['Team']
+                    cpt_own = cpt_player_info['Ownership']
+                    cpt_name = cpt_player_info['Name']
 
+                    for i, player_id in enumerate(ids):
+                        if new_player_dict[player_id]['rosterPosition'] == 'FLEX':
+                            flex_pos = new_player_dict[player_id]['Position'][0]
+                            flex_team = new_player_dict[player_id]['Team']
+                            flex_name = new_player_dict[player_id]['Name']
+                            flex_own = ownership[i]
+                            flex_salary = salaries[i]
+                            
+                            adj_own = NFL_Showdown_Simulator.adjust_ownership(cpt_pos, flex_pos, cpt_team, flex_team, cpt_name, flex_name, cpt_own, flex_own, flex_salary)
+                            adjusted_ownership[i] = adj_own
+                            
                 if (
                     cpt_selected
                     and "QB" in new_player_dict[choice]["Position"]
                     and "DEF" in [new_player_dict[x]["Position"] for x in lineup]
                 ):
-                    continue
+                    break
 
                 lineup.append(str(choice))
                 in_lineup[choice_idx] = 1
@@ -888,20 +942,23 @@ class NFL_Showdown_Simulator:
                 proj += projections[choice_idx]
                 remaining_salary = salary_ceiling - salary
 
-                # lineup_matchups.append(matchups[choice_idx[0]])
                 player_teams.append(teams[choice_idx][0])
 
                 if teams[choice_idx][0] == def_opp:
                     players_opposing_def += 1
 
-            if NFL_Showdown_Simulator.validate_lineup(
-                salary,
-                salary_floor,
-                salary_ceiling,
-                proj,
-                optimal_score,
-                max_pct_off_optimal,
-                player_teams,
+            # Check if the lineup is valid and has the correct number of players
+            if (
+                len(lineup) == num_players_in_roster
+                and NFL_Showdown_Simulator.validate_lineup(
+                    salary,
+                    salary_floor,
+                    salary_ceiling,
+                    proj,
+                    optimal_score,
+                    max_pct_off_optimal,
+                    player_teams,
+                )
             ):
                 lus[lu_num] = {
                     "Lineup": lineup,
@@ -912,8 +969,10 @@ class NFL_Showdown_Simulator:
                     "Type": "generated",
                     "Count": 0
                 }
-                break
-        return lus
+                return lus
+
+        # If we couldn't generate a valid lineup after max_iterations, return None
+        return None
 
     def remap_player_dict(self, player_dict):
         remapped_dict = {}
@@ -1080,7 +1139,14 @@ class NFL_Showdown_Simulator:
         for i, o in enumerate(output):
             lineup_list = sorted(next(iter(o.values()))["Lineup"])
             lineup_set = frozenset(lineup_list)  # Convert the list to a frozenset
-
+            #check to make sure that the lineup is valid
+            if len(lineup_set) != len(set(lineup_set)):
+                print("bad lineup", lineup_set)
+                continue
+            if len(lineup_set) != len(self.roster_construction):
+                print("lineup has wrong number of players", lineup_set)
+                print(f"original lineup len: {len(lineup_list)}, lineup set len: {len(lineup_set)}, original lineup: {lineup_list}, lineup set: {lineup_set}")
+                continue
             # Keeping track of lineup duplication counts
             if lineup_set in self.seen_lineups:
                 self.seen_lineups[lineup_set] += 1
@@ -1251,100 +1317,100 @@ class NFL_Showdown_Simulator:
         for i, player in enumerate(game):
             temp_fpts_dict[player["UniqueKey"]] = correlated_samples[i]
 
-        print(f"Starting to generate plots for {team1_id} vs {team2_id}")
+        # print(f"Starting to generate plots for {team1_id} vs {team2_id}")
 
-        # Ensure the 'simulation_plots' directory exists
-        os.makedirs('simulation_plots', exist_ok=True)
-        print(f"Created 'simulation_plots' directory")
+        # # Ensure the 'simulation_plots' directory exists
+        # os.makedirs('simulation_plots', exist_ok=True)
+        # print(f"Created 'simulation_plots' directory")
 
-        # Plot distributions using KDE
-        plt.figure(figsize=(20, 10))
-        for i, player in enumerate(game):
-            sns.kdeplot(correlated_samples[i], label=f"{player['Name']} ({player['Team']})")
+        # # Plot distributions using KDE
+        # plt.figure(figsize=(20, 10))
+        # for i, player in enumerate(game):
+        #     sns.kdeplot(correlated_samples[i], label=f"{player['Name']} ({player['Team']})")
 
-        plt.title(f"Fantasy Point Distributions - {team1_id} vs {team2_id}")
-        plt.xlabel("Fantasy Points")
-        plt.ylabel("Density")
-        plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left', fontsize=8)
-        plt.tight_layout()
+        # plt.title(f"Fantasy Point Distributions - {team1_id} vs {team2_id}")
+        # plt.xlabel("Fantasy Points")
+        # plt.ylabel("Density")
+        # plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left', fontsize=8)
+        # plt.tight_layout()
         
-        distribution_plot_path = f'simulation_plots/{team1_id}_vs_{team2_id}_distributions.png'
-        plt.savefig(distribution_plot_path)
-        plt.close()
-        print(f"Saved distribution plot to {distribution_plot_path}")
+        # distribution_plot_path = f'simulation_plots/{team1_id}_vs_{team2_id}_distributions.png'
+        # plt.savefig(distribution_plot_path)
+        # plt.close()
+        # print(f"Saved distribution plot to {distribution_plot_path}")
 
-        # Plot default correlation matrix
-        plt.figure(figsize=(20, 18))
-        sns.heatmap(corr_matrix, annot=True, cmap='coolwarm', vmin=-1, vmax=1, 
-                    annot_kws={'size': 8}, fmt='.2f')
-        plt.title("Default Player Correlations")
+        # # Plot default correlation matrix
+        # plt.figure(figsize=(20, 18))
+        # sns.heatmap(corr_matrix, annot=True, cmap='coolwarm', vmin=-1, vmax=1, 
+        #             annot_kws={'size': 8}, fmt='.2f')
+        # plt.title("Default Player Correlations")
         
-        # Adjust labels for correlation matrix
-        player_labels = [f"{player['Name']} ({player['Team']})" for player in game]
-        plt.xticks(np.arange(len(player_labels)) + 0.5, player_labels, rotation=90, ha='right', fontsize=8)
-        plt.yticks(np.arange(len(player_labels)) + 0.5, player_labels, rotation=0, fontsize=8)
+        # # Adjust labels for correlation matrix
+        # player_labels = [f"{player['Name']} ({player['Team']})" for player in game]
+        # plt.xticks(np.arange(len(player_labels)) + 0.5, player_labels, rotation=90, ha='right', fontsize=8)
+        # plt.yticks(np.arange(len(player_labels)) + 0.5, player_labels, rotation=0, fontsize=8)
 
-        plt.tight_layout()
-        default_corr_plot_path = f'simulation_plots/{team1_id}_vs_{team2_id}_default_correlations.png'
-        plt.savefig(default_corr_plot_path, dpi=300, bbox_inches='tight')
-        plt.close()
-        print(f"Saved default correlation plot to {default_corr_plot_path}")
+        # plt.tight_layout()
+        # default_corr_plot_path = f'simulation_plots/{team1_id}_vs_{team2_id}_default_correlations.png'
+        # plt.savefig(default_corr_plot_path, dpi=300, bbox_inches='tight')
+        # plt.close()
+        # print(f"Saved default correlation plot to {default_corr_plot_path}")
 
-        # Calculate and plot the correlation matrix of the correlated samples
-        sample_corr_matrix = np.corrcoef(correlated_samples)
+        # # Calculate and plot the correlation matrix of the correlated samples
+        # sample_corr_matrix = np.corrcoef(correlated_samples)
         
-        plt.figure(figsize=(20, 18))
-        sns.heatmap(sample_corr_matrix, annot=True, cmap='coolwarm', vmin=-1, vmax=1, 
-                    annot_kws={'size': 8}, fmt='.2f')
-        plt.title("Sampled Player Correlations")
+        # plt.figure(figsize=(20, 18))
+        # sns.heatmap(sample_corr_matrix, annot=True, cmap='coolwarm', vmin=-1, vmax=1, 
+        #             annot_kws={'size': 8}, fmt='.2f')
+        # plt.title("Sampled Player Correlations")
         
-        # Use the same player labels as before
-        plt.xticks(np.arange(len(player_labels)) + 0.5, player_labels, rotation=90, ha='right', fontsize=8)
-        plt.yticks(np.arange(len(player_labels)) + 0.5, player_labels, rotation=0, fontsize=8)
+        # # Use the same player labels as before
+        # plt.xticks(np.arange(len(player_labels)) + 0.5, player_labels, rotation=90, ha='right', fontsize=8)
+        # plt.yticks(np.arange(len(player_labels)) + 0.5, player_labels, rotation=0, fontsize=8)
 
-        plt.tight_layout()
-        sample_corr_plot_path = f'simulation_plots/{team1_id}_vs_{team2_id}_sampled_correlations.png'
-        plt.savefig(sample_corr_plot_path, dpi=300, bbox_inches='tight')
-        plt.close()
-        print(f"Saved sampled correlation plot to {sample_corr_plot_path}")
+        # plt.tight_layout()
+        # sample_corr_plot_path = f'simulation_plots/{team1_id}_vs_{team2_id}_sampled_correlations.png'
+        # plt.savefig(sample_corr_plot_path, dpi=300, bbox_inches='tight')
+        # plt.close()
+        # print(f"Saved sampled correlation plot to {sample_corr_plot_path}")
 
-        # Create a dataframe with player statistics and trimming info
-        player_stats = []
-        for i, player in enumerate(game):
-            samples = correlated_samples[i]
-            stats = {
-                'Name': f"{player['Name']} ({player['Team']})",
-                'Position': player['Position'][0],
-                'Projected Mean': player['Fpts'],
-                'Projected StdDev': player['StdDev'],
-                'Sampled Mean': np.mean(samples),
-                'Sampled StdDev': np.std(samples),
-                'Sampled Median': np.median(samples),
-                'Sampled Min': np.min(samples),
-                'Sampled Max': np.max(samples),
-                'Percent Above Limit': trim_stats[i]['Percent Above Limit'],
-                'Percent Below Zero': trim_stats[i]['Percent Below Zero']
-            }
-            player_stats.append(stats)
+        # # Create a dataframe with player statistics and trimming info
+        # player_stats = []
+        # for i, player in enumerate(game):
+        #     samples = correlated_samples[i]
+        #     stats = {
+        #         'Name': f"{player['Name']} ({player['Team']})",
+        #         'Position': player['Position'][0],
+        #         'Projected Mean': player['Fpts'],
+        #         'Projected StdDev': player['StdDev'],
+        #         'Sampled Mean': np.mean(samples),
+        #         'Sampled StdDev': np.std(samples),
+        #         'Sampled Median': np.median(samples),
+        #         'Sampled Min': np.min(samples),
+        #         'Sampled Max': np.max(samples),
+        #         'Percent Above Limit': trim_stats[i]['Percent Above Limit'],
+        #         'Percent Below Zero': trim_stats[i]['Percent Below Zero']
+        #     }
+        #     player_stats.append(stats)
 
-        stats_df = pd.DataFrame(player_stats)
+        # stats_df = pd.DataFrame(player_stats)
 
-        # Plot the statistics table including trimming info
-        plt.figure(figsize=(20, len(game) * 0.5))
-        plt.axis('off')
-        table = plt.table(cellText=stats_df.values,
-                        colLabels=stats_df.columns,
-                        cellLoc='center',
-                        loc='center')
-        table.auto_set_font_size(False)
-        table.set_fontsize(8)
-        table.scale(1, 1.5)
-        plt.title("Player Statistics and Trimming Information", fontsize=16)
+        # # Plot the statistics table including trimming info
+        # plt.figure(figsize=(20, len(game) * 0.5))
+        # plt.axis('off')
+        # table = plt.table(cellText=stats_df.values,
+        #                 colLabels=stats_df.columns,
+        #                 cellLoc='center',
+        #                 loc='center')
+        # table.auto_set_font_size(False)
+        # table.set_fontsize(8)
+        # table.scale(1, 1.5)
+        # plt.title("Player Statistics and Trimming Information", fontsize=16)
         
-        stats_plot_path = f'simulation_plots/{team1_id}_vs_{team2_id}_player_stats_and_trimming.png'
-        plt.savefig(stats_plot_path, dpi=300, bbox_inches='tight')
-        plt.close()
-        print(f"Saved player statistics and trimming plot to {stats_plot_path}")
+        # stats_plot_path = f'simulation_plots/{team1_id}_vs_{team2_id}_player_stats_and_trimming.png'
+        # plt.savefig(stats_plot_path, dpi=300, bbox_inches='tight')
+        # plt.close()
+        # print(f"Saved player statistics and trimming plot to {stats_plot_path}")
 
         return temp_fpts_dict
 
@@ -1411,12 +1477,15 @@ class NFL_Showdown_Simulator:
                         cpt_dict[player_data_cpt["UniqueKey"]] = cpt_outcomes
             return cpt_dict
 
-        # Validation on lineups
-        for f in self.field_lineups:
-            if len(self.field_lineups[f]["Lineup"]) != len(
-                self.roster_construction
-            ):
-                print("bad lineup", f, self.field_lineups[f])
+        # # Validation on lineups
+        # for f in self.field_lineups:
+        #     if len(self.field_lineups[f]["Lineup"]) != len(
+        #         self.roster_construction
+        #     ):
+        #         print("bad lineup", f, self.field_lineups[f])
+        #         for p in self.player_dict:
+        #             if self.player_dict[p]['UniqueKey'] in self.field_lineups[f]['Lineup']:
+        #                 print(self.player_dict[p]['Name'], self.player_dict[p]['Position'], self.player_dict[p]['Team'])
 
         start_time = time.time()
         temp_fpts_dict = {}
