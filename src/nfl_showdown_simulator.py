@@ -1174,6 +1174,7 @@ class NFL_Showdown_Simulator:
         return alpha, beta
 
     def run_simulation_for_game(self, team1_id, team1, team2_id, team2, num_iterations):
+        sim_rng = np.random.default_rng(seed=int(time.time() * 1000000))
         def get_corr_value(player1, player2):
             # First, check for specific player-to-player correlations
             if player2["ID"] in player1.get("Player Correlations", {}):
@@ -1184,7 +1185,7 @@ class NFL_Showdown_Simulator:
                 "QB": -0.5,
                 "RB": -0.05,
                 "WR": 0.01,
-                "TE": 0.01,
+                "TE": -0.02,
                 "K": -0.5,
                 "DST": -0.5,
             }
@@ -1207,70 +1208,101 @@ class NFL_Showdown_Simulator:
             projected_mean = player['Fpts']
             projected_std = player['StdDev']
 
-            # Set the upper limit as a multiple of the standard deviation above the mean
             upper_limit = projected_mean + 5 * projected_std
 
             if position in ['WR', 'RB', 'TE']:
-                # Use truncated exponential distribution for skill positions
                 scale = projected_std
-                samples = truncexpon.rvs(b=upper_limit/scale, loc=0, scale=scale, size=num_iterations)
+                samples = sim_rng.exponential(scale=scale, size=num_iterations)
+                samples = np.minimum(samples, upper_limit)
                 
-            elif position in ['QB', 'DST']:
-                # Use truncated normal distribution for QBs and DSTs
-                a, b = (0 - projected_mean) / projected_std, (upper_limit - projected_mean) / projected_std
-                samples = truncnorm.rvs(a, b, loc=projected_mean, scale=projected_std, size=num_iterations)
+            elif position == 'DST':
+                samples = sim_rng.normal(loc=projected_mean, scale=projected_std, size=num_iterations)
+                samples = np.clip(samples, -4, upper_limit)
+            
+            elif position == 'QB':
+                samples = sim_rng.normal(loc=projected_mean, scale=projected_std, size=num_iterations)
+                samples = np.clip(samples, -10, upper_limit)
             
             elif position == 'K':
-                # Use gamma distribution for Kickers, but truncate at upper_limit
                 shape = (projected_mean / projected_std) ** 2
                 scale = projected_std ** 2 / projected_mean
-                samples = gamma.rvs(a=shape, scale=scale, size=num_iterations)
+                samples = sim_rng.gamma(shape, scale=scale, size=num_iterations)
                 samples = np.minimum(samples, upper_limit)
             
             else:
                 raise ValueError(f"Unknown position: {position}")
 
-            # Ensure non-negative values and match the projected mean exactly
-            samples = np.maximum(samples, 0)
+            # Ensure non-negative values (except for DST) and match the projected mean exactly
             samples = (samples - np.mean(samples)) * (projected_std / np.std(samples)) + projected_mean
 
             return samples
         
         def build_covariance_matrix(players):
             N = len(players)
-            corr_matrix = [[0 for _ in range(N)] for _ in range(N)]
+            corr_matrix = np.eye(N)  # Start with identity matrix (1s on diagonal)
 
             for i in range(N):
-                for j in range(N):
-                    if i == j:
-                        corr_matrix[i][j] = 1
-                    else:
-                        corr_matrix[i][j] = get_corr_value(players[i], players[j])
-            return np.array(corr_matrix)
+                for j in range(i+1, N):  # Only compute upper triangle
+                    corr_value = get_corr_value(players[i], players[j])
+                    corr_matrix[i, j] = corr_value
+                    corr_matrix[j, i] = corr_value  # Ensure symmetry
+
+            return corr_matrix
 
         def ensure_positive_definite(matrix):
             # Compute the eigenvalues
             eigenvalues = np.linalg.eigvals(matrix)
             
-            # If any eigenvalues are negative or close to zero, adjust them
-            if np.any(eigenvalues < 1e-8):
-                min_eig = np.min(eigenvalues)
-                matrix += (-min_eig + 1e-8) * np.eye(len(matrix))
+            # If any eigenvalues are complex or negative, adjust them
+            if np.any(np.imag(eigenvalues) != 0) or np.any(eigenvalues < 1e-8):
+                # Use the real part of eigenvalues and ensure they're positive
+                min_eig = np.min(np.real(eigenvalues))
+                adjustment = max(-min_eig + 1e-8, 0)
+                matrix += adjustment * np.eye(len(matrix))
             
             # Ensure symmetry
             matrix = (matrix + matrix.T) / 2
             
             return matrix
 
+        # Debug print
+        #print(f"Simulating game: {team1_id} vs {team2_id}")
+        #print(f"Number of players in team1: {len(team1)}")
+        #print(f"Number of players in team2: {len(team2)}")
+
         # Filter out players with projections less than or equal to 0
         team1 = [player for player in team1 if player['Fpts'] > 0]
         team2 = [player for player in team2 if player['Fpts'] > 0]
 
         game = team1 + team2
+        
+        #print("Players in the game:")
+        #for player in game:
+        #    print(f"Name: {player['Name']}, Team: {player['Team']}, Position: {player['Position']}, Fpts: {player['Fpts']}, StdDev: {player['StdDev']}")
+
         corr_matrix = build_covariance_matrix(game)
+
+       # print("\nCorrelation Matrix:")
+       # np.set_printoptions(precision=3, suppress=True)
+       # print(corr_matrix)
+
+        # Check for symmetry
+        #if not np.allclose(corr_matrix, corr_matrix.T):
+        #    print("Warning: Correlation matrix is not symmetric")
+
+        # Check for positive semi-definiteness
+        eigenvalues = np.linalg.eigvals(corr_matrix)
+        #print("\nEigenvalues of the correlation matrix:")
+        #print(eigenvalues)
+
+        if np.any(eigenvalues < 0):
+            print("Warning: Correlation matrix is not positive semi-definite")
 
         # Ensure the correlation matrix is positive definite
         corr_matrix = ensure_positive_definite(corr_matrix)
+
+        #print("\nAdjusted Correlation Matrix:")
+        #print(corr_matrix)
 
         # Generate uncorrelated samples
         uncorrelated_samples = np.array([generate_samples(player, num_iterations) for player in game])
@@ -1284,7 +1316,7 @@ class NFL_Showdown_Simulator:
             correlated_samples = uncorrelated_samples
 
         # Track trimming statistics
-        trim_stats = []
+        #trim_stats = []
 
         # Ensure means match projected values after correlation
         for i, player in enumerate(game):
@@ -1301,43 +1333,90 @@ class NFL_Showdown_Simulator:
             correlated_samples[i] = (correlated_samples[i] - np.mean(correlated_samples[i])) * (player['StdDev'] / np.std(correlated_samples[i])) + player['Fpts']
             correlated_samples[i] = np.maximum(correlated_samples[i], 0)  # Ensure non-negative values
             
-            # Store trimming statistics
-            trim_stats.append({
-                'Name': f"{player['Name']} ({player['Team']})",
-                'Position': player['Position'][0],
-                'Projected Mean': player['Fpts'],
-                'Projected StdDev': player['StdDev'],
-                'Samples Above Limit': samples_above_limit,
-                'Samples Below Zero': samples_below_zero,
-                'Percent Above Limit': (samples_above_limit / num_iterations) * 100,
-                'Percent Below Zero': (samples_below_zero / num_iterations) * 100
-            })
+            # Calculate additional statistics
+            final_mean = np.mean(correlated_samples[i])
+            final_std = np.std(correlated_samples[i])
+            sample_min = np.min(correlated_samples[i])
+            sample_max = np.max(correlated_samples[i])
+            
+        #     # Store trimming statistics
+        #     trim_stats.append({
+        #         'Name': f"{player['Name']} ({player['Team']})",
+        #         'Position': player['Position'][0],
+        #         'Projected Mean': player['Fpts'],
+        #         'Projected StdDev': player['StdDev'],
+        #         'Final Mean': final_mean,
+        #         'Final StdDev': final_std,
+        #         'Sampled Min': sample_min,
+        #         'Sampled Max': sample_max,
+        #         'Samples Above Limit': samples_above_limit,
+        #         'Samples Below Zero': samples_below_zero,
+        #         'Percent Above Limit': (samples_above_limit / num_iterations) * 100,
+        #         'Percent Below Zero': (samples_below_zero / num_iterations) * 100
+        #     })
+
+        # # Create DataFrame and set display options
+        # pd.set_option('display.max_rows', None)
+        # pd.set_option('display.max_columns', None)
+        # pd.set_option('display.width', None)
+        # pd.set_option('display.float_format', '{:.2f}'.format)
+        
+        # trimmed_stats = pd.DataFrame(trim_stats)
+        # print(trimmed_stats)
+        
+        # # Reset display options to default
+        # pd.reset_option('display.max_rows')
+        # pd.reset_option('display.max_columns')
+        # pd.reset_option('display.width')
+        # pd.reset_option('display.float_format')
 
         temp_fpts_dict = {}
         for i, player in enumerate(game):
             temp_fpts_dict[player["UniqueKey"]] = correlated_samples[i]
 
+        # # Modify the plotting code
         # print(f"Starting to generate plots for {team1_id} vs {team2_id}")
-
-        # # Ensure the 'simulation_plots' directory exists
         # os.makedirs('simulation_plots', exist_ok=True)
-        # print(f"Created 'simulation_plots' directory")
 
-        # # Plot distributions using KDE
-        # plt.figure(figsize=(20, 10))
-        # for i, player in enumerate(game):
-        #     sns.kdeplot(correlated_samples[i], label=f"{player['Name']} ({player['Team']})")
+        # team_colors = {team1_id: 'purple', team2_id: 'red'}
+        # position_styles = {'QB': '-', 'RB': '--', 'WR': '-.', 'TE': ':', 'K': '-', 'DST': '--'}
 
-        # plt.title(f"Fantasy Point Distributions - {team1_id} vs {team2_id}")
-        # plt.xlabel("Fantasy Points")
-        # plt.ylabel("Density")
-        # plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left', fontsize=8)
+        # # Sort players by projected points
+        # sorted_players = sorted(enumerate(game), key=lambda x: x[1]['Fpts'], reverse=True)
+
+        # # Split players into three groups
+        # n = len(sorted_players)
+        # groups = [sorted_players[:n//3], sorted_players[n//3:2*n//3], sorted_players[2*n//3:]]
+
+        # fig, axs = plt.subplots(3, 1, figsize=(20, 30))
+        # group_names = ['High Projected', 'Medium Projected', 'Low Projected']
+
+        # for ax, group, name in zip(axs, groups, group_names):
+        #     for i, player in group:
+        #         team = player['Team']
+        #         position = player['Position'][0]
+        #         name = player['Name']
+                
+        #         color = team_colors[team]
+        #         style = position_styles[position]
+                
+        #         sns.kdeplot(correlated_samples[i], color=color, linestyle=style, 
+        #                     label=f"{name} ({team} {position})", ax=ax, bw_adjust=1.5)
+
+        #     ax.set_title(f"{name} Players")
+        #     ax.set_xlabel("Fantasy Points")
+        #     ax.set_ylabel("Density")
+        #     ax.set_yscale('log')  # Use log scale for y-axis
+        #     ax.legend(bbox_to_anchor=(1.05, 1), loc='upper left', fontsize=8)
+        #     ax.grid(True, alpha=0.3)
+
         # plt.tight_layout()
-        
         # distribution_plot_path = f'simulation_plots/{team1_id}_vs_{team2_id}_distributions.png'
-        # plt.savefig(distribution_plot_path)
+        # plt.savefig(distribution_plot_path, dpi=300, bbox_inches='tight')
         # plt.close()
         # print(f"Saved distribution plot to {distribution_plot_path}")
+
+
 
         # # Plot default correlation matrix
         # plt.figure(figsize=(20, 18))
