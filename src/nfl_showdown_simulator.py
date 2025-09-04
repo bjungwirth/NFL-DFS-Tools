@@ -15,11 +15,12 @@ import itertools
 import collections
 import re
 from scipy.stats import norm, kendalltau, multivariate_normal, gamma, lognorm
-from scipy.stats import truncnorm, truncexpon, gamma
+from scipy.stats import truncnorm, truncexpon, gamma, nbinom, poisson, skewnorm, exponnorm, weibull_min, gengamma
 import matplotlib.pyplot as plt
 import seaborn as sns
 from numba import jit
 import sys
+import yaml
 
 
 @jit(nopython=True)  # nopython mode ensures the function is fully optimized
@@ -43,6 +44,361 @@ pos_own_corr = {
     'RBQB0': -0.91, 'TEQB0': -1.096, 'WRQB0': -1.134, 'DSTQB0': -1.367, 'QBQB0': -1.612,
     'TETE1': -1.742, 'QBQB1': -3.946
 }
+
+
+def load_distribution_data(site):
+    """Load distribution parameters from CSV file"""
+    distribution_file = f"distribution_data/fp_distributions_{site}.csv"
+    distributions = pd.read_csv(distribution_file)
+    return distributions
+
+def load_correlation_data(site):
+    """Load correlations, preferring YAML; fallback to NPZ.
+
+    Returns a tuple (yaml_index, npz_obj)
+    - yaml_index: dict or None. Indexed correlations by (pos1,pos2,same_team)->list of entries
+    - npz_obj: numpy-loaded object or None
+    """
+    yaml_path = f"distribution_data/fp_correlations_{site}.yaml"
+    npz_path = f"distribution_data/fp_correlations_{site}.npz"
+
+    yaml_index = None
+    npz_obj = None
+
+    if os.path.exists(yaml_path):
+        try:
+            with open(yaml_path, 'r', encoding='utf-8') as f:
+                data = yaml.safe_load(f)
+            # Expect top-level key 'correlations' which is a list of dicts
+            entries = data.get('correlations', []) if isinstance(data, dict) else []
+            yaml_index = index_yaml_correlations(entries)
+        except Exception as e:
+            print(f"Failed to load YAML correlations at {yaml_path}: {e}")
+
+    if yaml_index is None and os.path.exists(npz_path):
+        try:
+            npz_obj = np.load(npz_path)
+        except Exception as e:
+            print(f"Failed to load NPZ correlations at {npz_path}: {e}")
+
+    return yaml_index, npz_obj
+
+def parse_window_range(window_str):
+    """Parse a window string like '3.0-5.0' or '6.70000000298-8.70000000298' into (low, high) floats."""
+    try:
+        s = str(window_str)
+        parts = s.split('-')
+        if len(parts) != 2:
+            return None
+        low = float(parts[0])
+        high = float(parts[1])
+        return (low, high)
+    except Exception:
+        return None
+
+def index_yaml_correlations(entries):
+    """Build an index dict from YAML entries for fast lookup.
+
+    Index: (pos1, pos2, same_team:bool) -> list of (win1_low, win1_high, win2_low, win2_high, corr)
+    """
+    index = {}
+    for e in entries:
+        try:
+            pos1 = str(e.get('pos1')).upper()
+            pos2 = str(e.get('pos2')).upper()
+            same_team = bool(e.get('same_team', True))
+            r1 = parse_window_range(e.get('win1'))
+            r2 = parse_window_range(e.get('win2'))
+            corr = float(e.get('correlation', 0.0))
+            if r1 is None or r2 is None:
+                continue
+            key = (pos1, pos2, same_team)
+            index.setdefault(key, []).append((r1[0], r1[1], r2[0], r2[1], corr))
+        except Exception:
+            continue
+    return index if len(index) > 0 else None
+
+def get_correlation_from_yaml_index(index, pos1, pos2, same_team, fp1, fp2):
+    """Lookup correlation from YAML index by positions, team context, and projected FPs.
+
+    - First try exact window containment for both players.
+    - If none, choose the entry with minimal distance to the centers.
+    - Falls back to 0.0 if not found.
+    """
+    if index is None:
+        return None
+    key = (pos1, pos2, same_team)
+    entries = index.get(key)
+    if not entries:
+        return None
+
+    # 1) Exact containment
+    matches = [
+        corr for (a, b, c, d, corr) in entries
+        if (a <= fp1 <= b) and (c <= fp2 <= d)
+    ]
+    if matches:
+        # Average in case of duplicates
+        return float(np.mean(matches))
+
+    # 2) Nearest by distance to interval centers
+    best_corr = None
+    best_dist = float('inf')
+    for a, b, c, d, corr in entries:
+        center1 = 0.5 * (a + b)
+        center2 = 0.5 * (c + d)
+        dist = abs(center1 - fp1) + abs(center2 - fp2)
+        if dist < best_dist:
+            best_dist = dist
+            best_corr = corr
+    return float(best_corr) if best_corr is not None else None
+
+def get_distribution_params(distributions_df, position, projected_fp, projected_stddev=None):
+    """Get distribution parameters for a player based on position and projection window.
+
+    Parameter calibration policy:
+    - Choose the row whose [window_start, window_end] contains projected_fp (or nearest by mean_input).
+    - Use that distribution FAMILY, but CALIBRATE parameters so the marginal matches:
+        mean = projected_fp, variance = projected_stddev^2 (if provided and > 0)
+      This reduces overly fat/skinny tails while respecting the empirical window selection.
+    - Returns dict including window_index/window bounds for correlation lookups.
+    """
+    # Filter by position first
+    pos_df_full = distributions_df[distributions_df['position'] == position]
+
+    if len(pos_df_full) == 0:
+        return None
+
+    # Identify the window row and its index within the sorted window list
+    window_idx = 0
+    best_dist = None
+    window_start = None
+    window_end = None
+
+    if 'window_start' in pos_df_full.columns and 'window_end' in pos_df_full.columns:
+        pos_df_sorted = (
+            pos_df_full.sort_values('window_start', kind='mergesort').reset_index(drop=True)
+        )
+        # Try to find containing window
+        found = False
+        for i, row in pos_df_sorted.iterrows():
+            ws = row['window_start']
+            we = row['window_end']
+            if ws <= projected_fp <= we:
+                window_idx = int(i)
+                best_dist = row
+                window_start = ws
+                window_end = we
+                found = True
+                break
+        # Fallback to nearest by mean_input
+        if not found:
+            pos_df_sorted['distance'] = np.abs(pos_df_sorted['mean_input'] - projected_fp)
+            best_dist = pos_df_sorted.nsmallest(1, 'distance').iloc[0]
+            window_idx = int(best_dist.name)
+            window_start = best_dist['window_start']
+            window_end = best_dist['window_end']
+    else:
+        # No windows; pick closest by mean_input
+        pos_df_sorted = pos_df_full.copy()
+        pos_df_sorted['distance'] = np.abs(pos_df_sorted['mean_input'] - projected_fp)
+        best_dist = pos_df_sorted.nsmallest(1, 'distance').iloc[0]
+        window_idx = int(best_dist.name)
+
+    # Base stats from the window row (for fallbacks only)
+    base_mean = float(best_dist.get('mean', projected_fp))
+    base_variance = float(best_dist.get('variance', max(projected_fp, 1.0)))
+
+    # Distribution-specific parameterization aligned to player's projected mean
+    dist_type = str(best_dist['distribution']).lower()
+
+    target_mean = float(projected_fp)
+    target_variance = None
+    if projected_stddev is not None and projected_stddev > 0:
+        target_variance = float(projected_stddev) ** 2
+
+    # If CSV provides complex fitted families, preserve their parameters; we'll sample then affine-adjust to target stats
+    if dist_type in ('weibull', 'lognormal', 'skew_normal', 'exgaussian', 'generalized_gamma', 'shifted_gamma'):
+        params = {
+            'distribution': dist_type,
+            'window_index': window_idx,
+            'window_start': window_start,
+            'window_end': window_end,
+        }
+        for key in ['mu', 'sigma', 'tau', 'alpha', 'loc', 'scale', 'a', 'd', 'beta', 'c', 'shift']:
+            if key in best_dist and not pd.isna(best_dist[key]):
+                params[key] = float(best_dist[key])
+        # Normalize generalized_gamma parameter naming: some CSVs store 'd' for scipy's 'c'
+        if dist_type == 'generalized_gamma' and 'c' not in params and 'd' in params:
+            params['c'] = params['d']
+        if 'mean' in best_dist and not pd.isna(best_dist['mean']):
+            params['base_mean'] = float(best_dist['mean'])
+        if 'variance' in best_dist and not pd.isna(best_dist['variance']):
+            params['base_variance'] = float(best_dist['variance'])
+        params['target_mean'] = float(projected_fp)
+        params['target_std'] = float(projected_stddev) if projected_stddev is not None else None
+        return params
+
+    if dist_type == 'gamma':
+        # Calibrate to match mean and, if available, variance
+        if target_variance is not None and target_variance > 0:
+            alpha = max(1e-6, (target_mean ** 2) / target_variance)
+            scale = max(1e-6, target_variance / target_mean)
+        else:
+            # Fallback: keep alpha from window, adjust scale by mean ratio
+            alpha = float(best_dist['alpha'])
+            scale = max(1e-6, (target_mean / alpha))
+        return {
+            'distribution': 'gamma',
+            'alpha': alpha,
+            'scale': scale,
+            'mean': alpha * scale,
+            'variance': alpha * (scale ** 2),
+            'window_index': window_idx,
+            'window_start': window_start,
+            'window_end': window_end,
+        }
+    elif dist_type in ('nbinom', 'negative_binomial'):
+        # Solve parameters from mean/variance when possible
+        if target_variance is not None and target_variance > target_mean + 1e-6:
+            p = max(1e-6, min(1 - 1e-6, target_mean / target_variance))
+            r = max(1e-6, (target_mean ** 2) / (target_variance - target_mean))
+        else:
+            # Fallback: keep p and adjust r to match mean
+            p = float(best_dist.get('p', best_dist.get('prob', 0.5)))
+            p = max(1e-6, min(1 - 1e-6, p))
+            r = max(1e-6, target_mean * p / (1 - p))
+        adjusted_mean = r * (1 - p) / p
+        adjusted_variance = r * (1 - p) / (p ** 2)
+        return {
+            'distribution': 'nbinom',
+            'r': r,
+            'n': r,
+            'p': p,
+            'mean': adjusted_mean,
+            'variance': adjusted_variance,
+            'window_index': window_idx,
+            'window_start': window_start,
+            'window_end': window_end,
+        }
+    elif dist_type == 'poisson':
+        lam = max(0.0, target_mean)
+        return {
+            'distribution': 'poisson',
+            'lambda': lam,
+            'mean': lam,
+            'variance': lam,
+            'window_index': window_idx,
+            'window_start': window_start,
+            'window_end': window_end,
+        }
+    elif dist_type in ('zero_inflated_poisson', 'zip'):
+        # Calibrate pi and lambda to match mean/variance when possible
+        base_pi = float(best_dist.get('pi', best_dist.get('zero_prob', 0.1)))
+        if target_variance is not None and target_variance >= target_mean and target_mean > 0:
+            # pi = (v/m - 1) / (m + v/m - 1)
+            ratio = max(0.0, target_variance / max(1e-6, target_mean) - 1.0)
+            denom = target_mean + max(1e-6, target_variance / max(1e-6, target_mean)) - 1.0
+            pi = max(0.0, min(0.95, ratio / max(1e-6, denom)))
+            lam = max(1e-6, target_mean / max(1e-6, (1.0 - pi)))
+        else:
+            pi = max(0.0, min(0.95, base_pi))
+            lam = max(1e-6, target_mean / max(1e-6, (1.0 - pi)))
+        adjusted_mean = (1 - pi) * lam
+        adjusted_variance = (1 - pi) * lam * (1 + pi * lam)
+        return {
+            'distribution': 'zero_inflated_poisson',
+            'pi': pi,
+            'zero_prob': pi,
+            'lambda': lam,
+            'mean': adjusted_mean,
+            'variance': adjusted_variance,
+            'window_index': window_idx,
+            'window_start': window_start,
+            'window_end': window_end,
+        }
+    elif dist_type == 'normal':
+        adjusted_mu = target_mean
+        adjusted_sigma = math.sqrt(target_variance) if (target_variance is not None and target_variance > 0) else math.sqrt(base_variance)
+        return {
+            'distribution': 'normal',
+            'mu': adjusted_mu,
+            'sigma': adjusted_sigma,
+            'mean': adjusted_mu,
+            'variance': adjusted_sigma ** 2,
+            'window_index': window_idx,
+            'window_start': window_start,
+            'window_end': window_end,
+            'original_sigma': adjusted_sigma,
+        }
+    else:
+        return None
+
+def get_correlation_value(correlations_npz, pos1, pos2, same_team=True):
+    """Get correlation value between two positions"""
+    team_suffix = 'same' if same_team else 'opp'
+    corr_key = f'corr_{pos1}_{pos2}_{team_suffix}'
+    
+    # Try the key as-is first
+    if corr_key in correlations_npz:
+        corr_values = correlations_npz[corr_key]
+        return float(np.mean(corr_values)) if len(corr_values) > 0 else 0.0
+    
+    # Try reversed positions
+    corr_key_reversed = f'corr_{pos2}_{pos1}_{team_suffix}'
+    if corr_key_reversed in correlations_npz:
+        corr_values = correlations_npz[corr_key_reversed]
+        return float(np.mean(corr_values)) if len(corr_values) > 0 else 0.0
+    
+    # Default correlation
+    return 0.0
+
+def get_correlation_value_at_windows(correlations_npz, pos1, pos2, idx1, idx2, same_team=True):
+    """Get correlation value for specific position pair at given projection windows.
+
+    Expects the npz to store 2D arrays per position pair with axes corresponding to projection windows.
+    Falls back gracefully to means if array dims don't match.
+    """
+    team_suffix = 'same' if same_team else 'opp'
+    key = f'corr_{pos1}_{pos2}_{team_suffix}'
+    rev_key = f'corr_{pos2}_{pos1}_{team_suffix}'
+
+    def _lookup(arr, i, j, transpose=False):
+        a = arr.T if transpose else arr
+        if a.ndim == 2:
+            ii = int(np.clip(i, 0, a.shape[0] - 1))
+            jj = int(np.clip(j, 0, a.shape[1] - 1))
+            return float(a[ii, jj])
+        elif a.ndim == 1:
+            ii = int(np.clip(i, 0, a.shape[0] - 1))
+            return float(a[ii])
+        else:
+            try:
+                return float(np.mean(a))
+            except Exception:
+                return 0.0
+
+    if key in correlations_npz:
+        return _lookup(correlations_npz[key], idx1, idx2, transpose=False)
+    if rev_key in correlations_npz:
+        # Reverse the orientation if using reversed key
+        return _lookup(correlations_npz[rev_key], idx2, idx1, transpose=True)
+    # Fallback to average correlation
+    return get_correlation_value(correlations_npz, pos1, pos2, same_team)
+
+def get_correlation_value_yaml_or_npz(corr_yaml_index, corr_npz, pos1, pos2, same_team, fp1, fp2, idx1, idx2):
+    """Unified correlation getter: try YAML (preferred), then NPZ by window indices, then NPZ mean, else 0.
+    fp1/fp2 are the players' projected fantasy points used to choose YAML windows.
+    """
+    # Prefer YAML if available
+    corr = get_correlation_from_yaml_index(corr_yaml_index, pos1, pos2, same_team, fp1, fp2) if corr_yaml_index is not None else None
+    if corr is not None:
+        return corr
+    # Fallback to NPZ with window indices
+    if corr_npz is not None:
+        return get_correlation_value_at_windows(corr_npz, pos1, pos2, idx1, idx2, same_team)
+    return 0.0
+
 
 class NFL_Showdown_Simulator:
     config = None
@@ -70,6 +426,9 @@ class NFL_Showdown_Simulator:
     teams_dict = collections.defaultdict(list)  # Initialize teams_dict
     correlation_rules = {}
     # Add this dictionary at the class level
+    distributions_df = None
+    correlations_npz = None
+    correlations_yaml_index = None
 
     def __init__(
         self,
@@ -83,6 +442,10 @@ class NFL_Showdown_Simulator:
         self.use_lineup_input = use_lineup_input
         self.load_config()
         self.load_rules()
+        # Load distribution/correlation data
+        site_name = "draftkings" if site == "dk" else "fanduel"
+        self.distributions_df = self.load_distribution_data(site_name)
+        self.correlations_yaml_index, self.correlations_npz = self.load_correlation_data(site_name)
 
         projection_path = os.path.join(
             os.path.dirname(__file__),
@@ -123,7 +486,7 @@ class NFL_Showdown_Simulator:
 
         elif site == "fd":
             self.salary = 60000
-            self.roster_construction = ["CPT", "FLEX", "FLEX", "FLEX", "FLEX"]
+            self.roster_construction = ["CPT", "FLEX", "FLEX", "FLEX", "FLEX", "FLEX"]
 
         self.use_contest_data = use_contest_data
         if use_contest_data:
@@ -147,6 +510,63 @@ class NFL_Showdown_Simulator:
         # if self.match_lineup_input_to_field_size or len(self.field_lineups) == 0:
         # self.generate_field_lineups()
         self.load_correlation_rules()
+
+    # ===== distribution/correlation helpers =====
+    def load_distribution_data(self, site):
+        distribution_file = f"distribution_data/fp_distributions_{site}.csv"
+        try:
+            return pd.read_csv(distribution_file)
+        except Exception as e:
+            print(f"Failed to load distributions at {distribution_file}: {e}")
+            return None
+
+    def load_correlation_data(self, site):
+        yaml_path = f"distribution_data/fp_correlations_{site}.yaml"
+        npz_path = f"distribution_data/fp_correlations_{site}.npz"
+        yaml_index = None
+        npz_obj = None
+        if os.path.exists(yaml_path):
+            try:
+                with open(yaml_path, 'r', encoding='utf-8') as f:
+                    data = yaml.safe_load(f)
+                entries = data.get('correlations', []) if isinstance(data, dict) else []
+                yaml_index = self.index_yaml_correlations(entries)
+            except Exception as e:
+                print(f"Failed to load YAML correlations at {yaml_path}: {e}")
+        if yaml_index is None and os.path.exists(npz_path):
+            try:
+                npz_obj = np.load(npz_path)
+            except Exception as e:
+                print(f"Failed to load NPZ correlations at {npz_path}: {e}")
+        return yaml_index, npz_obj
+
+    def parse_window_range(self, window_str):
+        try:
+            s = str(window_str)
+            parts = s.split('-')
+            if len(parts) != 2:
+                return None
+            return float(parts[0]), float(parts[1])
+        except Exception:
+            return None
+
+    def index_yaml_correlations(self, entries):
+        index = {}
+        for e in entries:
+            try:
+                pos1 = str(e.get('pos1')).upper()
+                pos2 = str(e.get('pos2')).upper()
+                same_team = bool(e.get('same_team', True))
+                r1 = self.parse_window_range(e.get('win1'))
+                r2 = self.parse_window_range(e.get('win2'))
+                corr = float(e.get('correlation', 0.0))
+                if r1 is None or r2 is None:
+                    continue
+                key = (pos1, pos2, same_team)
+                index.setdefault(key, []).append((r1[0], r1[1], r2[0], r2[1], corr))
+            except Exception:
+                continue
+        return index if len(index) > 0 else None
 
     # make column lookups on datafiles case insensitive
     def lower_first(self, iterator):
@@ -245,7 +665,7 @@ class NFL_Showdown_Simulator:
             if pos_str == "FLEX"
         ]
 
-        number_needed = 5 if self.site == "dk" else 4
+        number_needed = 5
         problem += (
             plp.lpSum(
                 lp_variables[self.player_dict[flex_tuple]["UniqueKey"]]
@@ -338,7 +758,7 @@ class NFL_Showdown_Simulator:
                 team_key = "teamabbrev" if self.site == "dk" else "team"
                 team = row[team_key]
                 game_info = "game info" if self.site == "dk" else "game"
-                match = re.search(pattern="(\w{2,4}@\w{2,4})", string=row[game_info])
+                match = re.search(pattern=r"(\w{2,4}@\w{2,4})", string=row[game_info])
                 if match:
                     opp = match.groups()[0].split("@")
                     self.matchups.add((opp[0], opp[1]))
@@ -512,10 +932,15 @@ class NFL_Showdown_Simulator:
                     continue
                 position = [pos for pos in row["position"].split("/")]
                 position.sort()
-                # if qb and dst not in position add flex
+                # Normalize FD DST naming
                 if self.site == "fd":
                     if "D" in position:
                         position = ["DST"]
+                        # FD projections often use full team name for DST; normalize to mascot/last token
+                        try:
+                            player_name = row["name"].split()[-1].replace("-", "#").lower().strip()
+                        except Exception:
+                            pass
                 pos = position[0]
                 if "stddev" in row:
                     if row["stddev"] == "" or float(row["stddev"]) == 0:
@@ -573,6 +998,11 @@ class NFL_Showdown_Simulator:
                 sal = int(row["salary"].replace(",", ""))
                 pos_str = "FLEX"
                 corr = correlation_matrix.get(pos, {})
+                # Attach distribution parameters for FLEX
+                try:
+                    dist_params = get_distribution_params(self.distributions_df, pos, fpts, stddev)
+                except Exception:
+                    dist_params = None
                 player_data = {
                     "Fpts": fpts,
                     "fieldFpts": fieldFpts,
@@ -582,12 +1012,14 @@ class NFL_Showdown_Simulator:
                     "Team": team,
                     "Opp": "",
                     "ID": "",
+                    "UniqueKey": "",
                     "Salary": sal,
                     "StdDev": stddev,
                     "Ceiling": ceil,
                     "Ownership": own,
                     "Correlations": corr,
                     "Player Correlations": {},
+                    "Distribution": dist_params,
                     "In Lineup": False,
                 }
                 # Check if player is in player_dict and get Opp, ID, Opp Pitcher ID and Opp Pitcher Name
@@ -602,10 +1034,13 @@ class NFL_Showdown_Simulator:
                 self.player_dict[(player_name, pos_str, team)] = player_data
                 self.teams_dict[team].append(player_data)
                 pos_str = "CPT"
-                if self.site == "dk":
-                    cpt_sal = 1.5 * sal
-                elif self.site == "fd":
-                    cpt_sal = sal
+                # FanDuel now mirrors DraftKings: MVP/CPT is 1.5x salary
+                cpt_sal = 1.5 * sal
+                # Attach distribution parameters for CPT (scaled fpts/stddev)
+                try:
+                    cpt_dist_params = get_distribution_params(self.distributions_df, pos, 1.5 * fpts, 1.5 * stddev)
+                except Exception:
+                    cpt_dist_params = None
                 player_data = {
                     "Fpts": 1.5 * fpts,
                     "fieldFpts": 1.5 * fieldFpts,
@@ -615,12 +1050,14 @@ class NFL_Showdown_Simulator:
                     "Team": team,
                     "Opp": "",
                     "ID": "",
+                    "UniqueKey": "",
                     "Salary": cpt_sal,
                     "StdDev": stddev,
                     "Ceiling": ceil,
                     "Ownership": cptOwn,
                     "Correlations": corr,
                     "Player Correlations": {},
+                    "Distribution": cpt_dist_params,
                     "In Lineup": False,
                 }
                 # Check if player is in player_dict and get Opp, ID, Opp Pitcher ID and Opp Pitcher Name
@@ -659,10 +1096,24 @@ class NFL_Showdown_Simulator:
             self.stacks_dict[team] = own_percentage
 
     def extract_id(self, cell_value):
-        if "(" in cell_value and ")" in cell_value:
-            return cell_value.split("(")[1].replace(")", "")
-        else:
-            return cell_value
+        s = str(cell_value).strip()
+        # DraftKings: Name (ID)
+        if "(" in s and ")" in s:
+            try:
+                # grab the last '('...')' pair to be safe
+                start = s.rfind("(")
+                end = s.rfind(")")
+                return s[start+1:end].strip()
+            except Exception:
+                pass
+        # FanDuel: ID:Name
+        if ":" in s:
+            try:
+                return s.split(":", 1)[0].strip()
+            except Exception:
+                pass
+        # Already an ID
+        return s
 
     def load_lineups_from_file(self):
         print("loading lineups")
@@ -1174,322 +1625,433 @@ class NFL_Showdown_Simulator:
         return alpha, beta
 
     def run_simulation_for_game(self, team1_id, team1, team2_id, team2, num_iterations):
-        sim_rng = np.random.default_rng(seed=int(time.time() * 1000000))
-        def get_corr_value(player1, player2):
-            # First, check for specific player-to-player correlations
-            if player2["ID"] in player1.get("Player Correlations", {}):
-                return player1["Player Correlations"][player2["ID"]]
+        def get_corr_value_from_data(player1, player2):
+            """Get correlation value from YAML/NPZ (preferred) with config fallback.
 
-            # If no specific correlation is found, proceed with the general logic
-            position_correlations = {
-                "QB": -0.5,
-                "RB": -0.05,
-                "WR": 0.01,
-                "TE": -0.02,
-                "K": -0.5,
-                "DST": -0.5,
-            }
+            Prioritize data-driven correlations to avoid overly strong defaults (e.g., WR-WR = 1.0).
+            """
+            # Player-to-player override wins
+            if player2["Name"] in player1.get("Player Correlations", {}):
+                return player1["Player Correlations"][player2["Name"]]
 
-            if player1["Team"] == player2["Team"] and player1["Position"][0] == player2["Position"][0]:
-                primary_position = player1["Position"][0]
-                return position_correlations[primary_position]
+            pos1 = player1["Position"][0] if player1["Position"] else "FLEX"
+            pos2 = player2["Position"][0] if player2["Position"] else "FLEX"
+            same_team = player1["Team"] == player2["Team"]
 
-            if player1["Team"] != player2["Team"]:
-                player_2_pos = "Opp " + str(player2["Position"][0])
-            else:
-                player_2_pos = player2["Position"][0]
+            # Prefer YAML/NPZ correlations
+            w1 = int((player1.get("Distribution") or {}).get("window_index", 0))
+            w2 = int((player2.get("Distribution") or {}).get("window_index", 0))
+            fp1 = float(player1.get("Fpts", 0.0))
+            fp2 = float(player2.get("Fpts", 0.0))
+            corr = get_correlation_value_yaml_or_npz(
+                self.correlations_yaml_index,
+                self.correlations_npz,
+                pos1,
+                pos2,
+                same_team,
+                fp1,
+                fp2,
+                w1,
+                w2,
+            )
+            if corr is not None:
+                # Clamp to a safe range to avoid near-singular matrices
+                return float(np.clip(corr, -0.95, 0.95))
 
-            return player1["Correlations"].get(
-                player_2_pos, 0
-            )  # Default to 0 if no correlation is found
-        
-        def generate_samples(player, num_iterations):
-            position = player['Position'][0]
-            projected_mean = player['Fpts']
-            projected_std = player['StdDev']
+            # Fallback to config-level positional correlation if available
+            pos_label = player2["Position"][0] if player2["Position"] else "FLEX"
+            key = pos_label if same_team else f"Opp {pos_label}"
+            if key in player1.get("Correlations", {}):
+                return float(np.clip(player1["Correlations"][key], -0.95, 0.95))
 
-            upper_limit = projected_mean + 5 * projected_std
+            return 0.0
 
-            if position in ['WR', 'RB', 'TE']:
-                scale = projected_std
-                samples = sim_rng.exponential(scale=scale, size=num_iterations)
-                samples = np.minimum(samples, upper_limit)
-                
-            elif position == 'DST':
-                samples = sim_rng.normal(loc=projected_mean, scale=projected_std, size=num_iterations)
-                samples = np.clip(samples, -4, upper_limit)
-            
-            elif position == 'QB':
-                samples = sim_rng.normal(loc=projected_mean, scale=projected_std, size=num_iterations)
-                samples = np.clip(samples, -10, upper_limit)
-            
-            elif position == 'K':
-                shape = (projected_mean / projected_std) ** 2
-                scale = projected_std ** 2 / projected_mean
-                samples = sim_rng.gamma(shape, scale=scale, size=num_iterations)
-                samples = np.minimum(samples, upper_limit)
-            
-            else:
-                raise ValueError(f"Unknown position: {position}")
+        def generate_samples_from_distributions(players, num_iterations):
+            """Generate samples using the distribution parameters for each player, including new families.
 
-            # Ensure non-negative values (except for DST) and match the projected mean exactly
-            samples = (samples - np.mean(samples)) * (projected_std / np.std(samples)) + projected_mean
+            For complex fitted families, we sample then apply an affine adjustment to match target mean/std when provided.
+            """
+            samples = np.zeros((num_iterations, len(players)))
+
+            def affine_match(x, target_mean, target_std):
+                if target_mean is None or target_std is None or target_std <= 0:
+                    return x
+                m = np.mean(x)
+                s = np.std(x)
+                if s <= 1e-12:
+                    return np.full_like(x, target_mean)
+                scale = target_std / s
+                shift = target_mean - scale * m
+                return shift + scale * x
+
+            def soft_ceiling_for(site, pos):
+                # Rough plausible ceilings (DK)
+                if site == 'dk':
+                    m = {
+                        'QB': 55.0,
+                        'RB': 60.0,
+                        'WR': 60.0,
+                        'TE': 45.0,
+                        'K': 25.0,
+                        'DST': 40.0,
+                    }
+                else:
+                    # FD a bit tighter due to scoring
+                    m = {
+                        'QB': 45.0,
+                        'RB': 50.0,
+                        'WR': 50.0,
+                        'TE': 35.0,
+                        'K': 20.0,
+                        'DST': 35.0,
+                    }
+                return m.get(pos, 60.0)
+
+            for i, player in enumerate(players):
+                dist_params = player.get("Distribution")
+                if not dist_params:
+                    samples[:, i] = np.random.normal(player["Fpts"], player["StdDev"], num_iterations)
+                    continue
+
+                d = dist_params.get("distribution")
+                x = None
+                if d == "gamma":
+                    x = gamma.rvs(a=dist_params["alpha"], scale=dist_params["scale"], size=num_iterations)
+                elif d == "normal":
+                    x = norm.rvs(loc=dist_params["mu"], scale=dist_params["sigma"], size=num_iterations)
+                elif d in ["nbinom", "negative_binomial"]:
+                    x = nbinom.rvs(n=dist_params["n"], p=dist_params["p"], size=num_iterations)
+                elif d == "poisson":
+                    x = poisson.rvs(mu=dist_params["lambda"], size=num_iterations)
+                elif d in ["zero_inflated_poisson", "zip"]:
+                    zero_prob = dist_params["zero_prob"]
+                    lambda_param = dist_params["lambda"]
+                    zero_mask = np.random.random(num_iterations) < zero_prob
+                    poisson_samples = poisson.rvs(mu=lambda_param, size=num_iterations)
+                    x = np.where(zero_mask, 0, poisson_samples)
+                elif d == "lognormal":
+                    mu = float(dist_params.get("mu", 0.0))
+                    sigma = max(1e-9, float(dist_params.get("sigma", 1.0)))
+                    x = lognorm(s=sigma, scale=np.exp(mu)).rvs(size=num_iterations)
+                elif d == "weibull":
+                    # Use weibull_min with shape=c's value residing in column 'a' or 'c'; and scale from column 'scale' if present
+                    c_shape = float(dist_params.get("a", dist_params.get("c", 1.0)))
+                    scale = float(dist_params.get("scale", 1.0))
+                    x = weibull_min(c=c_shape, scale=scale).rvs(size=num_iterations)
+                elif d == "skew_normal":
+                    # scipy skewnorm uses shape (alpha), loc, scale. We mapped csv: alpha->alpha, loc->loc, scale->scale
+                    alpha = float(dist_params.get("alpha", 0.0))
+                    loc = float(dist_params.get("loc", 0.0))
+                    scale = max(1e-9, float(dist_params.get("scale", 1.0)))
+                    x = skewnorm(a=alpha, loc=loc, scale=scale).rvs(size=num_iterations)
+                    # allow small negatives; no clipping here
+                elif d == "exgaussian":
+                    # scipy exponnorm K = tau/sigma; loc=mu; scale=sigma
+                    mu = float(dist_params.get("mu", 0.0))
+                    sigma = max(1e-9, float(dist_params.get("sigma", 1.0)))
+                    tau = max(1e-9, float(dist_params.get("tau", 1.0)))
+                    K = tau / sigma
+                    x = exponnorm(K=K, loc=mu, scale=sigma).rvs(size=num_iterations)
+                elif d == "generalized_gamma":
+                    a_par = float(dist_params.get("a", 1.0))
+                    c_par = float(dist_params.get("c", dist_params.get("d", 1.0)))
+                    scale = float(dist_params.get("scale", 1.0))
+                    # scipy gengamma uses a (shape), c (shape), scale
+                    x = gengamma(a=a_par, c=c_par, scale=scale).rvs(size=num_iterations)
+                elif d == "shifted_gamma":
+                    alpha = float(dist_params.get("alpha", 1.0))
+                    scale = float(dist_params.get("scale", 1.0))
+                    shift = float(dist_params.get("shift", 0.0))
+                    x = shift + gamma.rvs(a=alpha, scale=scale, size=num_iterations)
+                else:
+                    x = np.random.normal(player["Fpts"], player["StdDev"], num_iterations)
+
+                # Affine adjust to target stats if provided
+                target_mean = dist_params.get('target_mean', player.get('Fpts'))
+                target_std = dist_params.get('target_std', player.get('StdDev'))
+                x = affine_match(x, target_mean, target_std)
+
+                # Guardrail: same as GPP – if heavy-tailed family yields implausible extreme tails relative to mean/std, fallback to calibrated gamma
+                pos0 = player.get('Position', [''])[0]
+                if d in ("generalized_gamma", "skew_normal"):
+                    cv = None
+                    if target_mean is not None and target_mean > 0 and target_std is not None and target_std > 0:
+                        cv = target_std / max(1e-9, target_mean)
+                    try:
+                        p999 = np.quantile(x, 0.999)
+                        p9995 = np.quantile(x, 0.9995)
+                        xmax = float(np.max(x))
+                    except Exception:
+                        p999, p9995, xmax = None, None, None
+                    heavy_tail = False
+                    if cv is None or cv < 0.6:
+                        if (p9995 is not None and p9995 > target_mean + 6.5 * target_std) or (p999 is not None and p999 > target_mean + 7.5 * target_std):
+                            heavy_tail = True
+                        if xmax is not None and xmax > target_mean + 8.0 * target_std:
+                            heavy_tail = True
+                    if heavy_tail and target_mean is not None and target_std is not None and target_std > 0:
+                        alpha = max(1e-6, (target_mean ** 2) / (target_std ** 2))
+                        scale = max(1e-6, (target_std ** 2) / target_mean)
+                        x = gamma.rvs(a=alpha, scale=scale, size=num_iterations)
+                samples[:, i] = x
 
             return samples
-        
-        def build_covariance_matrix(players):
+
+        def build_correlation_matrix(players):
+            """Build correlation matrix using data from .npz file"""
             N = len(players)
-            corr_matrix = np.eye(N)  # Start with identity matrix (1s on diagonal)
-
+            corr_matrix = np.eye(N)
+            
             for i in range(N):
-                for j in range(i+1, N):  # Only compute upper triangle
-                    corr_value = get_corr_value(players[i], players[j])
-                    corr_matrix[i, j] = corr_value
-                    corr_matrix[j, i] = corr_value  # Ensure symmetry
-
+                for j in range(i + 1, N):
+                    correlation = get_corr_value_from_data(players[i], players[j])
+                    corr_matrix[i][j] = correlation
+                    corr_matrix[j][i] = correlation  # Symmetric
+                    
             return corr_matrix
 
-        def ensure_positive_definite(matrix):
-            # Compute the eigenvalues
-            eigenvalues = np.linalg.eigvals(matrix)
-            
-            # If any eigenvalues are complex or negative, adjust them
-            if np.any(np.imag(eigenvalues) != 0) or np.any(eigenvalues < 1e-8):
-                # Use the real part of eigenvalues and ensure they're positive
-                min_eig = np.min(np.real(eigenvalues))
-                adjustment = max(-min_eig + 1e-8, 0)
-                matrix += adjustment * np.eye(len(matrix))
-            
-            # Ensure symmetry
-            matrix = (matrix + matrix.T) / 2
-            
-            return matrix
+        def apply_correlation_to_samples(samples, correlation_matrix):
+            """Apply correlation via Iman–Conover rank reordering.
 
-        # Debug print
-        #print(f"Simulating game: {team1_id} vs {team2_id}")
-        #print(f"Number of players in team1: {len(team1)}")
-        #print(f"Number of players in team2: {len(team2)}")
+            - Generate correlated normals with desired correlation.
+            - Use their rank order to permute each column of original samples.
+            This preserves marginals and approximates the target correlation.
+            """
+            try:
+                num_rows, num_cols = samples.shape
+                if num_cols == 0 or num_rows == 0:
+                    return samples
+
+                # Ensure matrix is usable (should already be PSD from caller)
+                try:
+                    L = np.linalg.cholesky(correlation_matrix)
+                except np.linalg.LinAlgError:
+                    eps = 1e-8
+                    L = np.linalg.cholesky(correlation_matrix + eps * np.eye(correlation_matrix.shape[0]))
+
+                # Generate independent normals and impose correlation
+                Z = np.random.standard_normal(size=(num_rows, num_cols))
+                Z_corr = Z @ L.T
+
+                # For each column, take ranks of Z_corr and reorder sorted original samples by these ranks
+                correlated_samples = np.empty_like(samples)
+                for j in range(num_cols):
+                    col = samples[:, j]
+                    if np.var(col) < 1e-12:
+                        correlated_samples[:, j] = col
+                        continue
+                    sorted_col = np.sort(col)
+                    # argsort of Z_corr gives order from low to high; place sorted_col accordingly
+                    order = np.argsort(Z_corr[:, j])
+                    correlated_samples[order, j] = sorted_col
+
+                return correlated_samples
+
+            except Exception as e:
+                print(f"Correlation application failed: {e}, using original samples")
+                return samples
+
+        def ensure_positive_semidefinite(matrix):
+            """Ensure correlation matrix is positive semidefinite and renormalize to correlation form (diag=1)."""
+            eigenvalues, eigenvectors = np.linalg.eigh(matrix)
+            eigenvalues[eigenvalues < 1e-8] = 1e-8
+            psd = eigenvectors @ np.diag(eigenvalues) @ eigenvectors.T
+            # Renormalize to correlation matrix
+            d = np.sqrt(np.clip(np.diag(psd), 1e-12, None))
+            psd = psd / np.outer(d, d)
+            np.fill_diagonal(psd, 1.0)
+            return psd
 
         # Filter out players with projections less than or equal to 0
-        team1 = [player for player in team1 if player['Fpts'] > 0]
-        team2 = [player for player in team2 if player['Fpts'] > 0]
+        team1 = [
+            player
+            for player in team1
+            if player["Fpts"] > 0 and player["rosterPosition"] == "FLEX"
+        ]
+        team2 = [
+            player
+            for player in team2
+            if player["Fpts"] > 0 and player["rosterPosition"] == "FLEX"
+        ]
 
         game = team1 + team2
         
-        #print("Players in the game:")
-        #for player in game:
-        #    print(f"Name: {player['Name']}, Team: {player['Team']}, Position: {player['Position']}, Fpts: {player['Fpts']}, StdDev: {player['StdDev']}")
+        # Build correlation matrix using data from .npz files
+        corr_matrix = build_correlation_matrix(game)
+        corr_matrix = ensure_positive_semidefinite(corr_matrix)
 
-        corr_matrix = build_covariance_matrix(game)
-
-       # print("\nCorrelation Matrix:")
-       # np.set_printoptions(precision=3, suppress=True)
-       # print(corr_matrix)
-
-        # Check for symmetry
-        #if not np.allclose(corr_matrix, corr_matrix.T):
-        #    print("Warning: Correlation matrix is not symmetric")
-
-        # Check for positive semi-definiteness
-        eigenvalues = np.linalg.eigvals(corr_matrix)
-        #print("\nEigenvalues of the correlation matrix:")
-        #print(eigenvalues)
-
-        if np.any(eigenvalues < 0):
-            print("Warning: Correlation matrix is not positive semi-definite")
-
-        # Ensure the correlation matrix is positive definite
-        corr_matrix = ensure_positive_definite(corr_matrix)
-
-        #print("\nAdjusted Correlation Matrix:")
-        #print(corr_matrix)
-
-        # Generate uncorrelated samples
-        uncorrelated_samples = np.array([generate_samples(player, num_iterations) for player in game])
-
-        # Apply correlation
         try:
-            L = np.linalg.cholesky(corr_matrix)
-            correlated_samples = np.dot(L, uncorrelated_samples)
-        except np.linalg.LinAlgError:
-            print(f"Warning: Cholesky decomposition failed for {team1_id} vs {team2_id}. Using uncorrelated samples.")
-            correlated_samples = uncorrelated_samples
+            # Generate samples using distribution parameters
+            samples = generate_samples_from_distributions(game, num_iterations)
+            
+            # print("Samples:")
+            # for i, g in enumerate(game):
+            #     s = samples[:, i]
+            #     print(f"{g['Name']}, Distribution Type: {g['Distribution']}, Fpts: {g['Fpts']}, StdDev: {g['StdDev']}, Samples: {s[:10]}, Mean: {np.mean(s)}, StdDev: {np.std(s)}, Variance: {np.var(s)}, Min: {np.min(s)}, Max: {np.max(s)}")
 
-        # Track trimming statistics
-        #trim_stats = []
+            # Apply correlation structure using copula approach
+            samples = apply_correlation_to_samples(samples, corr_matrix)
 
-        # Ensure means match projected values after correlation
-        for i, player in enumerate(game):
-            upper_limit = player['Fpts'] + 5 * player['StdDev']
+            # print("Correlated Samples:")
+            # for i, g in enumerate(game):
+            #     s = samples[:, i]
+            #     print(f"{g['Name']}, Distribution Type: {g['Distribution']}, Fpts: {g['Fpts']}, StdDev: {g['StdDev']}, Samples: {s[:10]}, Mean: {np.mean(s)}, StdDev: {np.std(s)}, Variance: {np.var(s)}, Min: {np.min(s)}, Max: {np.max(s)}")
             
-            # Count how many samples are above the upper limit
-            samples_above_limit = np.sum(correlated_samples[i] > upper_limit)
-            
-            # Count how many samples are below zero
-            samples_below_zero = np.sum(correlated_samples[i] < 0)
-            
-            # Apply trimming
-            correlated_samples[i] = np.minimum(correlated_samples[i], upper_limit)
-            correlated_samples[i] = (correlated_samples[i] - np.mean(correlated_samples[i])) * (player['StdDev'] / np.std(correlated_samples[i])) + player['Fpts']
-            correlated_samples[i] = np.maximum(correlated_samples[i], 0)  # Ensure non-negative values
-            
-            # Calculate additional statistics
-            final_mean = np.mean(correlated_samples[i])
-            final_std = np.std(correlated_samples[i])
-            sample_min = np.min(correlated_samples[i])
-            sample_max = np.max(correlated_samples[i])
-            
-        #     # Store trimming statistics
-        #     trim_stats.append({
-        #         'Name': f"{player['Name']} ({player['Team']})",
-        #         'Position': player['Position'][0],
-        #         'Projected Mean': player['Fpts'],
-        #         'Projected StdDev': player['StdDev'],
-        #         'Final Mean': final_mean,
-        #         'Final StdDev': final_std,
-        #         'Sampled Min': sample_min,
-        #         'Sampled Max': sample_max,
-        #         'Samples Above Limit': samples_above_limit,
-        #         'Samples Below Zero': samples_below_zero,
-        #         'Percent Above Limit': (samples_above_limit / num_iterations) * 100,
-        #         'Percent Below Zero': (samples_below_zero / num_iterations) * 100
-        #     })
+        except Exception as e:
+            print(f"{team1_id}, {team2_id}, simulation error: {str(e)}")
+            return {}
 
-        # # Create DataFrame and set display options
-        # pd.set_option('display.max_rows', None)
-        # pd.set_option('display.max_columns', None)
-        # pd.set_option('display.width', None)
-        # pd.set_option('display.float_format', '{:.2f}'.format)
-        
-        # trimmed_stats = pd.DataFrame(trim_stats)
-        # print(trimmed_stats)
-        
-        # # Reset display options to default
-        # pd.reset_option('display.max_rows')
-        # pd.reset_option('display.max_columns')
-        # pd.reset_option('display.width')
-        # pd.reset_option('display.float_format')
+        player_samples = [samples[:, i] for i in range(len(game))]
 
         temp_fpts_dict = {}
         for i, player in enumerate(game):
-            temp_fpts_dict[player["UniqueKey"]] = correlated_samples[i]
+            temp_fpts_dict[player["UniqueKey"]] = player_samples[i]
 
-        # # Modify the plotting code
-        # print(f"Starting to generate plots for {team1_id} vs {team2_id}")
-        # os.makedirs('simulation_plots', exist_ok=True)
+        # # Generate charts for distributions and correlations
+        # fig = plt.figure(figsize=(22, 20))
+        # gs = fig.add_gridspec(3, 2, height_ratios=[1.2, 1.0, 1.0])
 
-        # team_colors = {team1_id: 'purple', team2_id: 'red'}
-        # position_styles = {'QB': '-', 'RB': '--', 'WR': '-.', 'TE': ':', 'K': '-', 'DST': '--'}
-
-        # # Sort players by projected points
-        # sorted_players = sorted(enumerate(game), key=lambda x: x[1]['Fpts'], reverse=True)
-
-        # # Split players into three groups
-        # n = len(sorted_players)
-        # groups = [sorted_players[:n//3], sorted_players[n//3:2*n//3], sorted_players[2*n//3:]]
-
-        # fig, axs = plt.subplots(3, 1, figsize=(20, 30))
-        # group_names = ['High Projected', 'Medium Projected', 'Low Projected']
-
-        # for ax, group, name in zip(axs, groups, group_names):
-        #     for i, player in group:
-        #         team = player['Team']
-        #         position = player['Position'][0]
-        #         name = player['Name']
-                
-        #         color = team_colors[team]
-        #         style = position_styles[position]
-                
-        #         sns.kdeplot(correlated_samples[i], color=color, linestyle=style, 
-        #                     label=f"{name} ({team} {position})", ax=ax, bw_adjust=1.5)
-
-        #     ax.set_title(f"{name} Players")
-        #     ax.set_xlabel("Fantasy Points")
-        #     ax.set_ylabel("Density")
-        #     ax.set_yscale('log')  # Use log scale for y-axis
-        #     ax.legend(bbox_to_anchor=(1.05, 1), loc='upper left', fontsize=8)
-        #     ax.grid(True, alpha=0.3)
-
-        # plt.tight_layout()
-        # distribution_plot_path = f'simulation_plots/{team1_id}_vs_{team2_id}_distributions.png'
-        # plt.savefig(distribution_plot_path, dpi=300, bbox_inches='tight')
-        # plt.close()
-        # print(f"Saved distribution plot to {distribution_plot_path}")
-
-
-
-        # # Plot default correlation matrix
-        # plt.figure(figsize=(20, 18))
-        # sns.heatmap(corr_matrix, annot=True, cmap='coolwarm', vmin=-1, vmax=1, 
-        #             annot_kws={'size': 8}, fmt='.2f')
-        # plt.title("Default Player Correlations")
-        
-        # # Adjust labels for correlation matrix
-        # player_labels = [f"{player['Name']} ({player['Team']})" for player in game]
-        # plt.xticks(np.arange(len(player_labels)) + 0.5, player_labels, rotation=90, ha='right', fontsize=8)
-        # plt.yticks(np.arange(len(player_labels)) + 0.5, player_labels, rotation=0, fontsize=8)
-
-        # plt.tight_layout()
-        # default_corr_plot_path = f'simulation_plots/{team1_id}_vs_{team2_id}_default_correlations.png'
-        # plt.savefig(default_corr_plot_path, dpi=300, bbox_inches='tight')
-        # plt.close()
-        # print(f"Saved default correlation plot to {default_corr_plot_path}")
-
-        # # Calculate and plot the correlation matrix of the correlated samples
-        # sample_corr_matrix = np.corrcoef(correlated_samples)
-        
-        # plt.figure(figsize=(20, 18))
-        # sns.heatmap(sample_corr_matrix, annot=True, cmap='coolwarm', vmin=-1, vmax=1, 
-        #             annot_kws={'size': 8}, fmt='.2f')
-        # plt.title("Sampled Player Correlations")
-        
-        # # Use the same player labels as before
-        # plt.xticks(np.arange(len(player_labels)) + 0.5, player_labels, rotation=90, ha='right', fontsize=8)
-        # plt.yticks(np.arange(len(player_labels)) + 0.5, player_labels, rotation=0, fontsize=8)
-
-        # plt.tight_layout()
-        # sample_corr_plot_path = f'simulation_plots/{team1_id}_vs_{team2_id}_sampled_correlations.png'
-        # plt.savefig(sample_corr_plot_path, dpi=300, bbox_inches='tight')
-        # plt.close()
-        # print(f"Saved sampled correlation plot to {sample_corr_plot_path}")
-
-        # # Create a dataframe with player statistics and trimming info
-        # player_stats = []
+        # # Plot 1: Player distributions (top-wide)
+        # ax1 = fig.add_subplot(gs[0, :])
         # for i, player in enumerate(game):
-        #     samples = correlated_samples[i]
-        #     stats = {
-        #         'Name': f"{player['Name']} ({player['Team']})",
-        #         'Position': player['Position'][0],
-        #         'Projected Mean': player['Fpts'],
-        #         'Projected StdDev': player['StdDev'],
-        #         'Sampled Mean': np.mean(samples),
-        #         'Sampled StdDev': np.std(samples),
-        #         'Sampled Median': np.median(samples),
-        #         'Sampled Min': np.min(samples),
-        #         'Sampled Max': np.max(samples),
-        #         'Percent Above Limit': trim_stats[i]['Percent Above Limit'],
-        #         'Percent Below Zero': trim_stats[i]['Percent Below Zero']
-        #     }
-        #     player_stats.append(stats)
+        #     # Use histplot with KDE for clarity and alpha stacking
+        #     sns.kdeplot(player_samples[i], ax=ax1, label=player['Name'], linewidth=1.1, alpha=0.7)
+        # ax1.legend(loc='upper right', fontsize=10, ncol=2)
+        # ax1.set_xlabel('Fpts')
+        # ax1.set_ylabel('Density')
+        # ax1.set_title(f'Showdown {team1_id}@{team2_id} Player Distributions')
+        # ax1.set_xlim(-5, 50)
 
-        # stats_df = pd.DataFrame(player_stats)
+        # # Prepare names once (short, readable labels)
+        # def short_label(p):
+        #     nm = p['Name']
+        #     pos = p['Position'][0] if p['Position'] else 'P'
+        #     tm = p['Team']
+        #     return f"{tm}-{pos}-{nm}"
+        # labels_unsorted = [short_label(player) for player in game]
 
-        # # Plot the statistics table including trimming info
-        # plt.figure(figsize=(20, len(game) * 0.5))
-        # plt.axis('off')
-        # table = plt.table(cellText=stats_df.values,
-        #                 colLabels=stats_df.columns,
-        #                 cellLoc='center',
-        #                 loc='center')
-        # table.auto_set_font_size(False)
-        # table.set_fontsize(8)
-        # table.scale(1, 1.5)
-        # plt.title("Player Statistics and Trimming Information", fontsize=16)
-        
-        # stats_plot_path = f'simulation_plots/{team1_id}_vs_{team2_id}_player_stats_and_trimming.png'
-        # plt.savefig(stats_plot_path, dpi=300, bbox_inches='tight')
-        # plt.close()
-        # print(f"Saved player statistics and trimming plot to {stats_plot_path}")
+        # # Plot 2: Actual correlation matrix (bottom-left)
+        # ax2 = fig.add_subplot(gs[1, 0])
+        # # Order by (Team, Position, Name) for readability and block structure
+        # order = sorted(range(len(game)), key=lambda i: (game[i]['Team'], (game[i]['Position'] or ['Z'])[0], game[i]['Name']))
+        # # Reindex samples and input matrix for plotting only
+        # samples_mat = np.column_stack(player_samples)  # shape: (num_iters, num_players)
+        # samples_sorted = samples_mat[:, order]
+        # corr_actual = np.corrcoef(samples_sorted, rowvar=False)
+        # sns.heatmap(
+        #     corr_actual,
+        #     ax=ax2,
+        #     cmap='coolwarm',
+        #     vmin=-0.4,
+        #     vmax=0.4,
+        #     annot=True,
+        #     fmt='.2f',
+        #     annot_kws={'size':9},
+        #     cbar_kws={'shrink':0.6},
+        #     square=True,
+        #     linewidths=0.2,
+        #     linecolor='white',
+        # )
+        # labels_sorted = [labels_unsorted[i] for i in order]
+        # ax2.set_xticks(np.arange(len(labels_sorted)) + 0.5)
+        # ax2.set_yticks(np.arange(len(labels_sorted)) + 0.5)
+        # ax2.set_xticklabels(labels_sorted, rotation=90, fontsize=8)
+        # ax2.set_yticklabels(labels_sorted, fontsize=8)
+        # ax2.set_title(f'Actual Correlation Matrix for Showdown {team1_id}@{team2_id}')
+        # # Team boundary lines
+        # team_order = [game[i]['Team'] for i in order]
+        # boundaries = [idx for idx in range(1, len(team_order)) if team_order[idx] != team_order[idx-1]]
+        # for b in boundaries:
+        #     ax2.axhline(b, color='black', lw=0.6)
+        #     ax2.axvline(b, color='black', lw=0.6)
+
+        # # Plot 3: Input correlation matrix (bottom-right)
+        # ax3 = fig.add_subplot(gs[1, 1])
+        # # Reindex input matrix to the same order for side-by-side comparison
+        # corr_input_sorted = corr_matrix[np.ix_(order, order)]
+        # sns.heatmap(
+        #     corr_input_sorted,
+        #     ax=ax3,
+        #     cmap='coolwarm',
+        #     vmin=-0.4,
+        #     vmax=0.4,
+        #     annot=True,
+        #     fmt='.2f',
+        #     annot_kws={'size':9},
+        #     cbar_kws={'shrink':0.6},
+        #     square=True,
+        #     linewidths=0.2,
+        #     linecolor='white',
+        # )
+        # ax3.set_xticks(np.arange(len(labels_sorted)) + 0.5)
+        # ax3.set_yticks(np.arange(len(labels_sorted)) + 0.5)
+        # ax3.set_xticklabels(labels_sorted, rotation=90, fontsize=8)
+        # ax3.set_yticklabels(labels_sorted, fontsize=8)
+        # ax3.set_title(f'Input Correlation Matrix for Showdown {team1_id}@{team2_id}')
+        # for b in boundaries:
+        #     ax3.axhline(b, color='black', lw=0.6)
+        #     ax3.axvline(b, color='black', lw=0.6)
+
+        # # Prepare output directory
+        # out_dir = os.path.join(os.path.dirname(__file__), "../output/sd_plots")
+        # os.makedirs(out_dir, exist_ok=True)
+
+        # # 1) Write per-player summary CSV with distribution params and sample stats
+        # try:
+        #     summary_rows = []
+        #     for i, player in enumerate(game):
+        #         s = player_samples[i]
+        #         dist_params = player.get("Distribution") or {}
+        #         # Basic stats
+        #         row = {
+        #             "Name": player.get("Name", ""),
+        #             "Team": player.get("Team", ""),
+        #             "Position": (player.get("Position") or ["P"])[0],
+        #             "ProjectedMean": float(player.get("Fpts", 0.0)),
+        #             "ProjectedStd": float(player.get("StdDev", 0.0)),
+        #             "DistType": str(dist_params.get("distribution", "normal_fallback")),
+        #             "WindowIndex": int(dist_params.get("window_index", -1)) if isinstance(dist_params.get("window_index", -1), (int, float)) else -1,
+        #             "WindowStart": dist_params.get("window_start"),
+        #             "WindowEnd": dist_params.get("window_end"),
+        #             "SampleMean": float(np.mean(s)) if s is not None and len(s) > 0 else np.nan,
+        #             "SampleStd": float(np.std(s)) if s is not None and len(s) > 0 else np.nan,
+        #             "SampleMin": float(np.min(s)) if s is not None and len(s) > 0 else np.nan,
+        #             "SampleP01": float(np.quantile(s, 0.01)) if s is not None and len(s) > 0 else np.nan,
+        #             "SampleP05": float(np.quantile(s, 0.05)) if s is not None and len(s) > 0 else np.nan,
+        #             "SampleMedian": float(np.median(s)) if s is not None and len(s) > 0 else np.nan,
+        #             "SampleP95": float(np.quantile(s, 0.95)) if s is not None and len(s) > 0 else np.nan,
+        #             "SampleP99": float(np.quantile(s, 0.99)) if s is not None and len(s) > 0 else np.nan,
+        #             "SampleMax": float(np.max(s)) if s is not None and len(s) > 0 else np.nan,
+        #         }
+        #         # Selected distribution parameters (if present)
+        #         for key in [
+        #             "alpha","scale","mu","sigma","tau","loc","a","c","d","shift","lambda","pi","zero_prob","p","r","n",
+        #             "base_mean","base_variance","target_mean","target_std"
+        #         ]:
+        #             if key in dist_params:
+        #                 try:
+        #                     row[f"param_{key}"] = float(dist_params[key])
+        #                 except Exception:
+        #                     row[f"param_{key}"] = dist_params[key]
+        #         summary_rows.append(row)
+        #     summary_df = pd.DataFrame(summary_rows)
+        #     summary_path = os.path.join(out_dir, f"{team1_id}_vs_{team2_id}_summary.csv")
+        #     summary_df.to_csv(summary_path, index=False)
+        #     print(f"Showdown summary CSV written: {summary_path}")
+        # except Exception as e:
+        #     print(f"Failed to write showdown summary CSV: {e}")
+
+        # # 2) Save chart to disk once (avoid overwriting with a blank fig)
+        # plot_path = os.path.join(out_dir, f"{team1_id}_vs_{team2_id}_plots.png")
+        # fig.tight_layout()
+        # # Ensure canvas renders in some non-interactive backends
+        # try:
+        #     fig.canvas.draw()
+        # except Exception:
+        #     pass
+        # fig.savefig(plot_path, dpi=220, bbox_inches='tight', facecolor='white')
+        # print(f"Showdown plot saved: {plot_path}")
+        # plt.close(fig)
 
         return temp_fpts_dict
 
@@ -1730,12 +2292,11 @@ class NFL_Showdown_Simulator:
             # Create lu_names in the correct order
             for player_id in sorted_lineup:
                 player_data = player_dict_values[player_id]
-                if self.site == "fd" and "CPT" in player_data["rosterPosition"]:
-                    player_id_str = player_data.get("ID", "")
-                    if player_id_str.endswith("69696969"):
-                        player_id_str = player_id_str.replace("69696969", "")
-                    lu_names.append(f"{player_data.get('Name', '')} ({player_id_str})")
+                if self.site == "fd":
+                    # FanDuel: id:name
+                    lu_names.append(f"{player_data.get('ID','')}:{player_data.get('Name','').replace('#','-')}")
                 else:
+                    # DraftKings: name (id)
                     lu_names.append(
                         f"{player_data.get('Name', '').replace('#','-')} ({player_data.get('ID', '')})"
                     )
@@ -1856,13 +2417,13 @@ class NFL_Showdown_Simulator:
         else:
             if self.use_contest_data:
                 with open(out_path, "w") as f:
-                    header = "Type,CPT,FLEX,FLEX,FLEX,FLEX,Salary,Fpts Proj,Field Fpts Proj,Ceiling,Primary Stack,Secondary Stack,Players vs DST,Win %,Top 10%,Cash %,Proj. Own. Product,Proj. Own. Sum,ROI,ROI/Entry Fee,Num Dupes\n"
+                    header = "Type,CPT,FLEX,FLEX,FLEX,FLEX,FLEX,Salary,Fpts Proj,Field Fpts Proj,Ceiling,Primary Stack,Secondary Stack,Players vs DST,Win %,Top 10%,Cash %,Proj. Own. Product,Proj. Own. Sum,ROI,ROI/Entry Fee,Num Dupes\n"
                     f.write(header)
                     for lineup_str, fpts in unique.items():
                         f.write(f"{lineup_str}\n")
             else:
                 with open(out_path, "w") as f:
-                    header = "Type,CPT,FLEX,FLEX,FLEX,FLEX,Salary,Fpts Proj,Field Fpts Proj,Ceiling,Primary Stack,Secondary Stack,Players vs DST,Win %,Top 10%,Cash %,Proj. Own. Product,Proj. Own. Sum,Num Dupes\n"
+                    header = "Type,CPT,FLEX,FLEX,FLEX,FLEX,FLEX,Salary,Fpts Proj,Field Fpts Proj,Ceiling,Primary Stack,Secondary Stack,Players vs DST,Win %,Top 10%,Cash %,Proj. Own. Product,Proj. Own. Sum,Num Dupes\n"
                     f.write(header)
                     for lineup_str, fpts in unique.items():
                         f.write(f"{lineup_str}\n")

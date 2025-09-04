@@ -16,11 +16,13 @@ import itertools
 import collections
 import re
 from scipy.stats import norm, kendalltau, multivariate_normal, gamma
+from scipy.stats import nbinom, poisson, lognorm, skewnorm, exponnorm, weibull_min, gengamma
 import matplotlib.pyplot as plt
 import seaborn as sns
 from collections import Counter
 from numba import jit
 import datetime
+import yaml
 
 @jit(nopython=True)
 def salary_boost(salary, max_salary):
@@ -65,6 +67,10 @@ class NFL_GPP_Simulator:
         7: ["TE"],
         8: ["RB", "WR", "TE"],
     }
+    # Distribution/correlation state
+    distributions_df = None
+    correlations_yaml_index = None
+    correlations_npz = None
 
     def __init__(
         self,
@@ -78,6 +84,10 @@ class NFL_GPP_Simulator:
         self.use_lineup_input = use_lineup_input
         self.load_config()
         self.load_rules()
+        # Load distribution/correlation data
+        site_name = "draftkings" if site == "dk" else "fanduel"
+        self.distributions_df = self.load_distribution_data(site_name)
+        self.correlations_yaml_index, self.correlations_npz = self.load_correlation_data(site_name)
 
         projection_path = os.path.join(
             os.path.dirname(__file__),
@@ -560,6 +570,222 @@ class NFL_GPP_Simulator:
                     )
         # print(self.payout_structure)
 
+    # ===== Distribution/correlation helpers =====
+    def load_distribution_data(self, site):
+        distribution_file = f"distribution_data/fp_distributions_{site}.csv"
+        try:
+            df = pd.read_csv(distribution_file)
+            if 'position' in df.columns:
+                df['position'] = df['position'].astype(str).str.upper()
+            if 'distribution' in df.columns:
+                df['distribution'] = df['distribution'].astype(str).str.lower()
+            return df
+        except Exception as e:
+            print(f"Failed to load distributions at {distribution_file}: {e}")
+            return None
+
+    def load_correlation_data(self, site):
+        yaml_path = f"distribution_data/fp_correlations_{site}.yaml"
+        npz_path = f"distribution_data/fp_correlations_{site}.npz"
+        yaml_index = None
+        npz_obj = None
+        if os.path.exists(yaml_path):
+            try:
+                with open(yaml_path, "r", encoding="utf-8") as f:
+                    data = yaml.safe_load(f)
+                entries = data.get("correlations", []) if isinstance(data, dict) else []
+                yaml_index = self.index_yaml_correlations(entries)
+            except Exception as e:
+                print(f"Failed to load YAML correlations at {yaml_path}: {e}")
+        if yaml_index is None and os.path.exists(npz_path):
+            try:
+                npz_obj = np.load(npz_path)
+            except Exception as e:
+                print(f"Failed to load NPZ correlations at {npz_path}: {e}")
+        return yaml_index, npz_obj
+
+    def parse_window_range(self, window_str):
+        try:
+            s = str(window_str)
+            parts = s.split("-")
+            if len(parts) != 2:
+                return None
+            return float(parts[0]), float(parts[1])
+        except Exception:
+            return None
+
+    def index_yaml_correlations(self, entries):
+        index = {}
+        for e in entries:
+            try:
+                pos1 = str(e.get("pos1")).upper()
+                pos2 = str(e.get("pos2")).upper()
+                same_team = bool(e.get("same_team", True))
+                r1 = self.parse_window_range(e.get("win1"))
+                r2 = self.parse_window_range(e.get("win2"))
+                corr = float(e.get("correlation", 0.0))
+                if r1 is None or r2 is None:
+                    continue
+                key = (pos1, pos2, same_team)
+                index.setdefault(key, []).append((r1[0], r1[1], r2[0], r2[1], corr))
+            except Exception:
+                continue
+        return index if len(index) > 0 else None
+
+    @staticmethod
+    def get_distribution_params(distributions_df, position, projected_fp, projected_stddev=None):
+        if distributions_df is None:
+            return None
+        pos_df_full = distributions_df[distributions_df['position'] == position]
+        if len(pos_df_full) == 0:
+            return None
+
+        window_idx = 0
+        best_dist = None
+        window_start = None
+        window_end = None
+
+        if 'window_start' in pos_df_full.columns and 'window_end' in pos_df_full.columns:
+            pos_df_sorted = pos_df_full.sort_values('window_start', kind='mergesort').reset_index(drop=True)
+            found = False
+            for i, row in pos_df_sorted.iterrows():
+                ws = row['window_start']
+                we = row['window_end']
+                if ws <= projected_fp <= we:
+                    window_idx = int(i)
+                    best_dist = row
+                    window_start = ws
+                    window_end = we
+                    found = True
+                    break
+            if not found:
+                pos_df_sorted['distance'] = np.abs(pos_df_sorted['mean_input'] - projected_fp)
+                best_dist = pos_df_sorted.nsmallest(1, 'distance').iloc[0]
+                window_idx = int(best_dist.name)
+                window_start = best_dist.get('window_start')
+                window_end = best_dist.get('window_end')
+        else:
+            pos_df_sorted = pos_df_full.copy()
+            pos_df_sorted['distance'] = np.abs(pos_df_sorted['mean_input'] - projected_fp)
+            best_dist = pos_df_sorted.nsmallest(1, 'distance').iloc[0]
+            window_idx = int(best_dist.name)
+
+        base_mean = float(best_dist.get('mean', projected_fp))
+        base_variance = float(best_dist.get('variance', max(projected_fp, 1.0)))
+        dist_type = str(best_dist['distribution']).lower()
+
+        target_mean = float(projected_fp)
+        target_variance = None
+        if projected_stddev is not None and projected_stddev > 0:
+            target_variance = float(projected_stddev) ** 2
+
+        if dist_type in ('weibull', 'lognormal', 'skew_normal', 'exgaussian', 'generalized_gamma', 'shifted_gamma'):
+            params = {
+                'distribution': dist_type,
+                'window_index': window_idx,
+                'window_start': window_start,
+                'window_end': window_end,
+            }
+            for key in ['mu', 'sigma', 'tau', 'alpha', 'loc', 'scale', 'a', 'd', 'beta', 'c', 'shift']:
+                if key in best_dist and not pd.isna(best_dist[key]):
+                    params[key] = float(best_dist[key])
+            if dist_type == 'generalized_gamma' and 'c' not in params and 'd' in params:
+                params['c'] = params['d']
+            if 'mean' in best_dist and not pd.isna(best_dist['mean']):
+                params['base_mean'] = float(best_dist['mean'])
+            if 'variance' in best_dist and not pd.isna(best_dist['variance']):
+                params['base_variance'] = float(best_dist['variance'])
+            params['target_mean'] = float(projected_fp)
+            params['target_std'] = float(projected_stddev) if projected_stddev is not None else None
+            return params
+
+        if dist_type == 'gamma':
+            if target_variance is not None and target_variance > 0:
+                alpha = max(1e-6, (target_mean ** 2) / target_variance)
+                scale = max(1e-6, target_variance / target_mean)
+            else:
+                alpha = float(best_dist['alpha'])
+                scale = max(1e-6, (target_mean / alpha))
+            return {
+                'distribution': 'gamma',
+                'alpha': alpha,
+                'scale': scale,
+                'mean': alpha * scale,
+                'variance': alpha * (scale ** 2),
+                'window_index': window_idx,
+                'window_start': window_start,
+                'window_end': window_end,
+            }
+        elif dist_type in ('nbinom', 'negative_binomial'):
+            if target_variance is not None and target_variance > target_mean + 1e-6:
+                p = max(1e-6, min(1 - 1e-6, target_mean / target_variance))
+                r = max(1e-6, (target_mean ** 2) / (target_variance - target_mean))
+            else:
+                p = float(best_dist.get('p', best_dist.get('prob', 0.5)))
+                p = max(1e-6, min(1 - 1e-6, p))
+                r = max(1e-6, target_mean * p / (1 - p))
+            return {
+                'distribution': 'nbinom',
+                'r': r,
+                'n': r,
+                'p': p,
+                'mean': r * (1 - p) / p,
+                'variance': r * (1 - p) / (p ** 2),
+                'window_index': window_idx,
+                'window_start': window_start,
+                'window_end': window_end,
+            }
+        elif dist_type == 'poisson':
+            lam = max(0.0, target_mean)
+            return {
+                'distribution': 'poisson',
+                'lambda': lam,
+                'mean': lam,
+                'variance': lam,
+                'window_index': window_idx,
+                'window_start': window_start,
+                'window_end': window_end,
+            }
+        elif dist_type in ('zero_inflated_poisson', 'zip'):
+            base_pi = float(best_dist.get('pi', best_dist.get('zero_prob', 0.1)))
+            if target_variance is not None and target_variance >= target_mean and target_mean > 0:
+                ratio = max(0.0, target_variance / max(1e-6, target_mean) - 1.0)
+                denom = target_mean + max(1e-6, target_variance / max(1e-6, target_mean)) - 1.0
+                pi = max(0.0, min(0.95, ratio / max(1e-6, denom)))
+                lam = max(1e-6, target_mean / max(1e-6, (1.0 - pi)))
+            else:
+                pi = max(0.0, min(0.95, base_pi))
+                lam = max(1e-6, target_mean / max(1e-6, (1.0 - pi)))
+            adjusted_mean = (1 - pi) * lam
+            adjusted_variance = (1 - pi) * lam * (1 + pi * lam)
+            return {
+                'distribution': 'zero_inflated_poisson',
+                'pi': pi,
+                'zero_prob': pi,
+                'lambda': lam,
+                'mean': adjusted_mean,
+                'variance': adjusted_variance,
+                'window_index': window_idx,
+                'window_start': window_start,
+                'window_end': window_end,
+            }
+        elif dist_type == 'normal':
+            adjusted_mu = target_mean
+            adjusted_sigma = math.sqrt(target_variance) if (target_variance is not None and target_variance > 0) else math.sqrt(base_variance)
+            return {
+                'distribution': 'normal',
+                'mu': adjusted_mu,
+                'sigma': adjusted_sigma,
+                'mean': adjusted_mu,
+                'variance': adjusted_sigma ** 2,
+                'window_index': window_idx,
+                'window_start': window_start,
+                'window_end': window_end,
+                'original_sigma': adjusted_sigma,
+            }
+        else:
+            return None
+
     def load_correlation_rules(self):
         if len(self.correlation_rules.keys()) > 0:
             for primary_player in self.correlation_rules.keys():
@@ -644,7 +870,9 @@ class NFL_GPP_Simulator:
                         position = ["DST"]
                 if "QB" not in position and "DST" not in position:
                     position.append("FLEX")
-                pos = position[0]
+                # Choose primary (non-FLEX) position for distributions/correlations
+                primary_positions = [p for p in position if p != "FLEX"]
+                pos = primary_positions[0] if len(primary_positions) > 0 else position[0]
                 if "stddev" in row:
                     if row["stddev"] == "" or float(row["stddev"]) == 0:
                         if position == "QB":
@@ -672,6 +900,8 @@ class NFL_GPP_Simulator:
                     ceil = fpts + stddev
                 if row["salary"]:
                     sal = int(row["salary"].replace(",", ""))
+                if stddev < 0:
+                    stddev = abs(stddev)
                 correlation_matrix = {
                     "QB": {"QB": 1.00, "RB": 0.10, "WR": 0.36, "TE": 0.35, "K": -0.02, "DST": 0.04, "Opp QB": 0.23, "Opp RB": 0.07, "Opp WR": 0.12, "Opp TE": 0.10, "Opp K": -0.03, "Opp DST": -0.30},
                     "RB": {"QB": 0.10, "RB": 1.00, "WR": 0.06, "TE": 0.03, "K": 0.16, "DST": 0.10, "Opp QB": 0.07, "Opp RB": -0.02, "Opp WR": 0.05, "Opp TE": 0.07, "Opp K": -0.13, "Opp DST": -0.21},
@@ -691,6 +921,11 @@ class NFL_GPP_Simulator:
                     own = 0.1
                 pos_str = str(position)
                 corr = correlation_matrix.get(pos, {})
+                # Attach distribution parameters based on position and projection window
+                try:
+                    dist_params = self.get_distribution_params(self.distributions_df, pos, fpts, stddev)
+                except Exception:
+                    dist_params = None
                 player_data = {
                     "Fpts": fpts,
                     "fieldFpts": fieldFpts,
@@ -699,13 +934,16 @@ class NFL_GPP_Simulator:
                     "Team": team,
                     "Opp": "",
                     "ID": "",
+                    "UniqueKey": "",
                     "Salary": int(row["salary"].replace(",", "")),
                     "StdDev": stddev,
                     "Ceiling": ceil,
                     "Ownership": own,
                     "Correlations": corr,
+                    
                     "Player Correlations": {},
                     "In Lineup": False,
+                    "Distribution": dist_params,
                 }
 
                 # Check if player is in player_dict and get Opp, ID, Opp Pitcher ID and Opp Pitcher Name
@@ -1259,97 +1497,178 @@ class NFL_GPP_Simulator:
         return alpha, beta
 
     @staticmethod
-    def run_simulation_for_game(team1_id, team1, team2_id, team2, num_iterations):
+    def run_simulation_for_game(team1_id, team1, team2_id, team2, num_iterations, roster_construction=None, correlations_yaml_index=None, correlations_npz=None, distributions_df=None):
         sim_rng = np.random.default_rng(seed=int(time.time() * 1000000))
+
+        def get_correlation_from_yaml_index(index, pos1, pos2, same_team, fp1, fp2):
+            if index is None:
+                return None
+            key = (pos1, pos2, same_team)
+            entries = index.get(key)
+            if not entries:
+                return None
+            matches = [corr for (a, b, c, d, corr) in entries if (a <= fp1 <= b) and (c <= fp2 <= d)]
+            if matches:
+                return float(np.mean(matches))
+            best_corr = None
+            best_dist = float('inf')
+            for a, b, c, d, corr in entries:
+                center1 = 0.5 * (a + b)
+                center2 = 0.5 * (c + d)
+                dist = abs(center1 - fp1) + abs(center2 - fp2)
+                if dist < best_dist:
+                    best_dist = dist
+                    best_corr = corr
+            return float(best_corr) if best_corr is not None else None
+
         def get_corr_value(player1, player2):
-            # First, check for specific player-to-player correlations
-            if player2["ID"] in player1.get("Player Correlations", {}):
-                return player1["Player Correlations"][player2["ID"]]
+            # Player-to-player hard override
+            if player2.get("ID") in player1.get("Player Correlations", {}):
+                return player1["Player Correlations"][player2["ID"]], "player"
 
-            # If no specific correlation is found, proceed with the general logic
-            position_correlations = {
-                "QB": -0.5,
-                "RB": -0.05,
-                "WR": 0.01,
-                "TE": -0.02,
-                "K": -0.5,
-                "DST": -0.5,
-            }
+            pos1 = player1["Position"][0] if player1["Position"] else "FLEX"
+            pos2 = player2["Position"][0] if player2["Position"] else "FLEX"
+            same_team = player1["Team"] == player2["Team"]
+            fp1 = float(player1.get("Fpts", 0.0))
+            fp2 = float(player2.get("Fpts", 0.0))
+            w1 = int((player1.get("Distribution") or {}).get("window_index", 0))
+            w2 = int((player2.get("Distribution") or {}).get("window_index", 0))
 
-            if player1["Team"] == player2["Team"] and player1["Position"][0] == player2["Position"][0]:
-                primary_position = player1["Position"][0]
-                return position_correlations[primary_position]
+            # Prefer YAML/NPZ
+            corr = None
+            if correlations_yaml_index is not None:
+                corr = get_correlation_from_yaml_index(correlations_yaml_index, pos1, pos2, same_team, fp1, fp2)
+            if corr is not None:
+                return float(np.clip(corr, -0.95, 0.95)), "yaml"
+            if corr is None and correlations_npz is not None:
+                # Fallback: simple mean over arrays by window indices if available
+                team_suffix = 'same' if same_team else 'opp'
+                key = f"corr_{pos1}_{pos2}_{team_suffix}"
+                rev_key = f"corr_{pos2}_{pos1}_{team_suffix}"
+                arr = correlations_npz[key] if key in correlations_npz else (correlations_npz[rev_key] if rev_key in correlations_npz else None)
+                if arr is not None:
+                    try:
+                        if arr.ndim == 2:
+                            ii = int(np.clip(w1, 0, arr.shape[0] - 1))
+                            jj = int(np.clip(w2, 0, arr.shape[1] - 1))
+                            corr = float(arr[ii, jj])
+                        elif arr.ndim == 1:
+                            ii = int(np.clip(w1, 0, arr.shape[0] - 1))
+                            corr = float(arr[ii])
+                        else:
+                            corr = float(np.mean(arr))
+                    except Exception:
+                        corr = float(np.mean(arr))
+                    return float(np.clip(corr, -0.95, 0.95)), "npz"
 
-            if player1["Team"] != player2["Team"]:
-                player_2_pos = "Opp " + str(player2["Position"][0])
-            else:
-                player_2_pos = player2["Position"][0]
+            # Fallback to config-level positional correlation
+            key = pos2 if same_team else f"Opp {pos2}"
+            if "Correlations" in player1 and key in player1["Correlations"]:
+                return float(np.clip(player1["Correlations"][key], -0.95, 0.95)), "config"
+            return 0.0, "zero"
 
-            return player1["Correlations"].get(
-                player_2_pos, 0
-            )  # Default to 0 if no correlation is found
-        
-        def generate_samples(player, num_iterations):
-            position = player['Position'][0]
-            projected_mean = player['Fpts']
-            projected_std = player['StdDev']
+        def generate_samples_from_distributions(players, num_iterations):
+            """Return array shape (N_players, num_iterations) using distribution params if available."""
+            samples = np.zeros((len(players), num_iterations))
 
-            upper_limit = projected_mean + 5 * projected_std
+            def affine_match(x, target_mean, target_std):
+                if target_mean is None or target_std is None or target_std <= 0:
+                    return x
+                m = np.mean(x)
+                s = np.std(x)
+                if s <= 1e-12:
+                    return np.full_like(x, target_mean)
+                scale = target_std / s
+                shift = target_mean - scale * m
+                return shift + scale * x
 
-            if position in ['WR', 'RB', 'TE']:
-                scale = projected_std
-                samples = sim_rng.exponential(scale=scale, size=num_iterations)
-                samples = np.minimum(samples, upper_limit)
-                
-            elif position == 'DST':
-                samples = sim_rng.normal(loc=projected_mean, scale=projected_std, size=num_iterations)
-                samples = np.clip(samples, -4, upper_limit)
-            
-            elif position == 'QB':
-                samples = sim_rng.normal(loc=projected_mean, scale=projected_std, size=num_iterations)
-                samples = np.clip(samples, -10, upper_limit)
-            
-            elif position == 'K':
-                shape = (projected_mean / projected_std) ** 2
-                scale = projected_std ** 2 / projected_mean
-                samples = sim_rng.gamma(shape, scale=scale, size=num_iterations)
-                samples = np.minimum(samples, upper_limit)
-            
-            else:
-                raise ValueError(f"Unknown position: {position}")
+            for i, player in enumerate(players):
+                dist_params = player.get("Distribution")
+                if not dist_params:
+                    # Normal fallback using projections
+                    x = sim_rng.normal(loc=player["Fpts"], scale=max(1e-9, player["StdDev"]), size=num_iterations)
+                    samples[i] = x
+                    continue
 
-            # Ensure non-negative values (except for DST) and match the projected mean exactly
-            samples = (samples - np.mean(samples)) * (projected_std / np.std(samples)) + projected_mean
+                d = str(dist_params.get("distribution", "normal")).lower()
+                x = None
+                if d == "gamma":
+                    x = gamma.rvs(a=float(dist_params["alpha"]), scale=float(dist_params["scale"]), size=num_iterations, random_state=None)
+                elif d == "normal":
+                    x = norm.rvs(loc=float(dist_params["mu"]), scale=max(1e-9, float(dist_params["sigma"])), size=num_iterations)
+                elif d in ("nbinom", "negative_binomial"):
+                    x = nbinom.rvs(n=float(dist_params.get("n", dist_params.get("r", 1.0))), p=float(dist_params["p"]), size=num_iterations)
+                elif d == "poisson":
+                    x = poisson.rvs(mu=float(dist_params["lambda"]), size=num_iterations)
+                elif d in ("zero_inflated_poisson", "zip"):
+                    zero_prob = float(dist_params.get("zero_prob", dist_params.get("pi", 0.0)))
+                    lam = float(dist_params["lambda"])
+                    mask = sim_rng.random(num_iterations) < zero_prob
+                    pois = poisson.rvs(mu=lam, size=num_iterations)
+                    x = np.where(mask, 0, pois)
+                elif d == "lognormal":
+                    mu = float(dist_params.get("mu", 0.0))
+                    sigma = max(1e-9, float(dist_params.get("sigma", 1.0)))
+                    x = lognorm(s=sigma, scale=np.exp(mu)).rvs(size=num_iterations)
+                elif d == "weibull":
+                    c_shape = float(dist_params.get("a", dist_params.get("c", 1.0)))
+                    scale = float(dist_params.get("scale", 1.0))
+                    x = weibull_min(c=c_shape, scale=scale).rvs(size=num_iterations)
+                elif d == "skew_normal":
+                    alpha = float(dist_params.get("alpha", 0.0))
+                    loc = float(dist_params.get("loc", 0.0))
+                    scale = max(1e-9, float(dist_params.get("scale", 1.0)))
+                    x = skewnorm(a=alpha, loc=loc, scale=scale).rvs(size=num_iterations)
+                elif d == "exgaussian":
+                    mu = float(dist_params.get("mu", 0.0))
+                    sigma = max(1e-9, float(dist_params.get("sigma", 1.0)))
+                    tau = max(1e-9, float(dist_params.get("tau", 1.0)))
+                    K = tau / sigma
+                    x = exponnorm(K=K, loc=mu, scale=sigma).rvs(size=num_iterations)
+                elif d == "generalized_gamma":
+                    a_par = float(dist_params.get("a", 1.0))
+                    c_par = float(dist_params.get("c", dist_params.get("d", 1.0)))
+                    scale = float(dist_params.get("scale", 1.0))
+                    x = gengamma(a=a_par, c=c_par, scale=scale).rvs(size=num_iterations)
+                elif d == "shifted_gamma":
+                    alpha = float(dist_params.get("alpha", 1.0))
+                    scale = float(dist_params.get("scale", 1.0))
+                    shift = float(dist_params.get("shift", 0.0))
+                    x = shift + gamma.rvs(a=alpha, scale=scale, size=num_iterations)
+                else:
+                    x = sim_rng.normal(loc=player["Fpts"], scale=max(1e-9, player["StdDev"]), size=num_iterations)
+
+                # Affine adjust to target
+                target_mean = dist_params.get("target_mean", player.get("Fpts"))
+                target_std = dist_params.get("target_std", player.get("StdDev"))
+                x = affine_match(x, target_mean, target_std)
+                samples[i] = x
 
             return samples
-        
+
         def build_covariance_matrix(players):
             N = len(players)
             corr_matrix = np.eye(N)  # Start with identity matrix (1s on diagonal)
+            source_counts = {"player": 0, "yaml": 0, "npz": 0, "config": 0, "zero": 0}
 
             for i in range(N):
                 for j in range(i+1, N):  # Only compute upper triangle
-                    corr_value = get_corr_value(players[i], players[j])
+                    corr_value, src = get_corr_value(players[i], players[j])
                     corr_matrix[i, j] = corr_value
                     corr_matrix[j, i] = corr_value  # Ensure symmetry
+                    source_counts[src] = source_counts.get(src, 0) + 1
 
-            return corr_matrix
+            return corr_matrix, source_counts
 
-        def ensure_positive_definite(matrix):
-            # Compute the eigenvalues
-            eigenvalues = np.linalg.eigvals(matrix)
-            
-            # If any eigenvalues are complex or negative, adjust them
-            if np.any(np.imag(eigenvalues) != 0) or np.any(eigenvalues < 1e-8):
-                # Use the real part of eigenvalues and ensure they're positive
-                min_eig = np.min(np.real(eigenvalues))
-                adjustment = max(-min_eig + 1e-8, 0)
-                matrix += adjustment * np.eye(len(matrix))
-            
-            # Ensure symmetry
-            matrix = (matrix + matrix.T) / 2
-            
-            return matrix
+        def ensure_positive_semidefinite(matrix):
+            # Clip eigenvalues and renormalize to correlation matrix (diag=1)
+            w, v = np.linalg.eigh(matrix)
+            w[w < 1e-8] = 1e-8
+            psd = v @ np.diag(w) @ v.T
+            d = np.sqrt(np.clip(np.diag(psd), 1e-12, None))
+            psd = psd / np.outer(d, d)
+            np.fill_diagonal(psd, 1.0)
+            return psd
 
         # Debug print
         #print(f"Simulating game: {team1_id} vs {team2_id}")
@@ -1366,7 +1685,7 @@ class NFL_GPP_Simulator:
         #for player in game:
         #    print(f"Name: {player['Name']}, Team: {player['Team']}, Position: {player['Position']}, Fpts: {player['Fpts']}, StdDev: {player['StdDev']}")
 
-        corr_matrix = build_covariance_matrix(game)
+        corr_matrix, corr_source_counts = build_covariance_matrix(game)
 
        # print("\nCorrelation Matrix:")
        # np.set_printoptions(precision=3, suppress=True)
@@ -1381,22 +1700,28 @@ class NFL_GPP_Simulator:
         #print("\nEigenvalues of the correlation matrix:")
         #print(eigenvalues)
 
-        if np.any(eigenvalues < 0):
-            print("Warning: Correlation matrix is not positive semi-definite")
+        if np.any(np.real(eigenvalues) < 0):
+            min_eig = np.min(np.real(eigenvalues))
+            print(f"Warning: Correlation matrix is not positive semi-definite for {team1_id}@{team2_id}. min_eig={min_eig:.6f}")
 
-        # Ensure the correlation matrix is positive definite
-        corr_matrix = ensure_positive_definite(corr_matrix)
+        # Ensure the correlation matrix is positive semi-definite and normalized
+        corr_matrix = ensure_positive_semidefinite(corr_matrix)
 
-        #print("\nAdjusted Correlation Matrix:")
-        #print(corr_matrix)
-
-        # Generate uncorrelated samples
-        uncorrelated_samples = np.array([generate_samples(player, num_iterations) for player in game])
+        # Generate samples from distributions (new logic) and then apply correlation via Cholesky to normals
+        uncorrelated_samples = generate_samples_from_distributions(game, num_iterations)
 
         # Apply correlation
         try:
             L = np.linalg.cholesky(corr_matrix)
-            correlated_samples = np.dot(L, uncorrelated_samples)
+            # Generate correlated normals and rank-map to preserve marginals (Iman–Conover)
+            Z = np.random.standard_normal(size=(num_iterations, uncorrelated_samples.shape[0]))
+            Z_corr = Z @ L.T
+            correlated_samples = np.empty_like(uncorrelated_samples)
+            for j in range(uncorrelated_samples.shape[0]):
+                col = uncorrelated_samples[j]
+                order = np.argsort(Z_corr[:, j])
+                sorted_col = np.sort(col)
+                correlated_samples[j][order] = sorted_col
         except np.linalg.LinAlgError:
             print(f"Warning: Cholesky decomposition failed for {team1_id} vs {team2_id}. Using uncorrelated samples.")
             correlated_samples = uncorrelated_samples
@@ -1458,7 +1783,8 @@ class NFL_GPP_Simulator:
 
         temp_fpts_dict = {}
         for i, player in enumerate(game):
-            temp_fpts_dict[player["UniqueKey"]] = correlated_samples[i]
+            # Use player ID as the key (aligns with lineup structures)
+            temp_fpts_dict[player.get("ID", "")] = correlated_samples[i]
 
         # # Modify the plotting code
         # print(f"Starting to generate plots for {team1_id} vs {team2_id}")
@@ -1577,6 +1903,157 @@ class NFL_GPP_Simulator:
         # plt.close()
         # print(f"Saved player statistics and trimming plot to {stats_plot_path}")
 
+        # ---- GPP: Per-game plots and summary (mirror showdown implementation) ----
+        # try:
+        #     # Labels and sorting
+        #     def short_label(p):
+        #         # Use last name only to keep labels compact
+        #         raw = str(p.get('Name', ''))
+        #         nm = raw.replace('#', ' ').split()[-1]
+        #         pos = p['Position'][0] if p['Position'] else 'P'
+        #         tm = p['Team']
+        #         return f"{tm}-{pos}-{nm}"
+
+        #     labels_unsorted = [short_label(p) for p in game]
+        #     order = sorted(range(len(game)), key=lambda i: (game[i]['Team'], (game[i]['Position'] or ['Z'])[0], game[i]['Name']))
+
+        #     samples_mat = correlated_samples.T  # (num_iters, num_players)
+        #     samples_sorted = samples_mat[:, order]
+        #     corr_actual = np.corrcoef(samples_sorted, rowvar=False)
+        #     corr_input_sorted = corr_matrix[np.ix_(order, order)]
+
+        #     fig = plt.figure(figsize=(22, 20))
+        #     gs = fig.add_gridspec(3, 2, height_ratios=[1.2, 1.0, 1.0])
+
+        #     ax1 = fig.add_subplot(gs[0, :])
+        #     for i in range(len(game)):
+        #         sns.kdeplot(correlated_samples[i], ax=ax1, label=game[i]['Name'], linewidth=1.1, alpha=0.7)
+        #     ax1.legend(loc='upper right', fontsize=10, ncol=2)
+        #     ax1.set_xlabel('Fpts')
+        #     ax1.set_ylabel('Density')
+        #     ax1.set_title(f'GPP {team1_id}@{team2_id} Player Distributions')
+        #     ax1.set_xlim(-5, 60)
+
+        #     ax2 = fig.add_subplot(gs[1, 0])
+        #     labels_sorted = [labels_unsorted[i] for i in order]
+        #     # Show only lower triangle to reduce clutter
+        #     mask_actual = np.triu(np.ones_like(corr_actual, dtype=bool), k=1)
+        #     sns.heatmap(
+        #         corr_actual,
+        #         mask=mask_actual,
+        #         ax=ax2,
+        #         cmap='coolwarm', vmin=-0.35, vmax=0.35,
+        #         annot=True, fmt='.2f', annot_kws={'size':10}, cbar_kws={'shrink':0.6},
+        #         square=True, linewidths=0.5, linecolor='white'
+        #     )
+        #     ax2.set_xticks(np.arange(len(labels_sorted)) + 0.5)
+        #     ax2.set_yticks(np.arange(len(labels_sorted)) + 0.5)
+        #     ax2.set_xticklabels(labels_sorted, rotation=70, ha='right', fontsize=8)
+        #     ax2.set_yticklabels(labels_sorted, fontsize=9)
+        #     ax2.set_title(f'Actual Correlation Matrix for GPP {team1_id}@{team2_id}')
+        #     # Team boundary lines
+        #     team_order = [game[i]['Team'] for i in order]
+        #     boundaries = [idx for idx in range(1, len(team_order)) if team_order[idx] != team_order[idx-1]]
+        #     for b in boundaries:
+        #         ax2.axhline(b, color='black', lw=0.6)
+        #         ax2.axvline(b, color='black', lw=0.6)
+
+        #     ax3 = fig.add_subplot(gs[1, 1])
+        #     mask_input = np.triu(np.ones_like(corr_input_sorted, dtype=bool), k=1)
+        #     sns.heatmap(
+        #         corr_input_sorted,
+        #         mask=mask_input,
+        #         ax=ax3,
+        #         cmap='coolwarm', vmin=-0.35, vmax=0.35,
+        #         annot=True, fmt='.2f', annot_kws={'size':10}, cbar_kws={'shrink':0.6},
+        #         square=True, linewidths=0.5, linecolor='white'
+        #     )
+        #     ax3.set_xticks(np.arange(len(labels_sorted)) + 0.5)
+        #     ax3.set_yticks(np.arange(len(labels_sorted)) + 0.5)
+        #     ax3.set_xticklabels(labels_sorted, rotation=70, ha='right', fontsize=8)
+        #     ax3.set_yticklabels(labels_sorted, fontsize=9)
+        #     ax3.set_title(f'Input Correlation Matrix for GPP {team1_id}@{team2_id}')
+        #     for b in boundaries:
+        #         ax3.axhline(b, color='black', lw=0.6)
+        #         ax3.axvline(b, color='black', lw=0.6)
+
+        #     ax4 = fig.add_subplot(gs[2, :])
+        #     ax4.text(0.02, 0.95, 'Distribution Summary:', transform=ax4.transAxes, fontsize=14, weight='bold')
+        #     y_pos = 0.88
+        #     for p in game:
+        #         dist_params = p.get('Distribution')
+        #         if dist_params:
+        #             d = dist_params.get('distribution', 'dist')
+        #             summary = f"{p['Name']}: {d}"
+        #         else:
+        #             summary = f"{p['Name']}: Normal fallback (μ={p['Fpts']:.2f}, σ={p['StdDev']:.2f})"
+        #         ax4.text(0.02, y_pos, summary, transform=ax4.transAxes, fontsize=9)
+        #         y_pos -= 0.06
+        #         if y_pos < 0.05:
+        #             break
+        #     # Correlation source summary in the figure footer
+        #     src_txt = (
+        #         f"Corr sources → YAML: {corr_source_counts.get('yaml',0)}, NPZ: {corr_source_counts.get('npz',0)}, "
+        #         f"Player: {corr_source_counts.get('player',0)}, Config: {corr_source_counts.get('config',0)}, Zero: {corr_source_counts.get('zero',0)}"
+        #     )
+        #     ax4.text(0.02, 0.05, src_txt, transform=ax4.transAxes, fontsize=9, style='italic')
+        #     ax4.axis('off')
+
+        #     out_dir = os.path.join(os.path.dirname(__file__), "../output/gpp_plots")
+        #     os.makedirs(out_dir, exist_ok=True)
+        #     plot_path = os.path.join(out_dir, f"{team1_id}_vs_{team2_id}_plots.png")
+        #     try:
+        #         fig.tight_layout()
+        #         try:
+        #             fig.canvas.draw()
+        #         except Exception:
+        #             pass
+        #         fig.savefig(plot_path, dpi=220, bbox_inches='tight', facecolor='white')
+        #         print(f"GPP plot saved: {plot_path}")
+        #     finally:
+        #         plt.close(fig)
+
+        #     try:
+        #         summary_rows = []
+        #         for i, p in enumerate(game):
+        #             s = correlated_samples[i]
+        #             dist_params = p.get('Distribution') or {}
+        #             row = {
+        #                 'Name': p.get('Name', ''),
+        #                 'Team': p.get('Team', ''),
+        #                 'Position': (p.get('Position') or ['P'])[0],
+        #                 'ProjectedMean': float(p.get('Fpts', 0.0)),
+        #                 'ProjectedStd': float(p.get('StdDev', 0.0)),
+        #                 'DistType': str(dist_params.get('distribution', 'normal_fallback')),
+        #                 'WindowIndex': int(dist_params.get('window_index', -1)) if isinstance(dist_params.get('window_index', -1), (int, float)) else -1,
+        #                 'WindowStart': dist_params.get('window_start'),
+        #                 'WindowEnd': dist_params.get('window_end'),
+        #                 'SampleMean': float(np.mean(s)) if s is not None and len(s) > 0 else np.nan,
+        #                 'SampleStd': float(np.std(s)) if s is not None and len(s) > 0 else np.nan,
+        #                 'SampleMin': float(np.min(s)) if s is not None and len(s) > 0 else np.nan,
+        #                 'SampleP01': float(np.quantile(s, 0.01)) if s is not None and len(s) > 0 else np.nan,
+        #                 'SampleP05': float(np.quantile(s, 0.05)) if s is not None and len(s) > 0 else np.nan,
+        #                 'SampleMedian': float(np.median(s)) if s is not None and len(s) > 0 else np.nan,
+        #                 'SampleP95': float(np.quantile(s, 0.95)) if s is not None and len(s) > 0 else np.nan,
+        #                 'SampleP99': float(np.quantile(s, 0.99)) if s is not None and len(s) > 0 else np.nan,
+        #                 'SampleMax': float(np.max(s)) if s is not None and len(s) > 0 else np.nan,
+        #             }
+        #             for key in ['alpha','scale','mu','sigma','tau','loc','a','c','d','shift','lambda','pi','zero_prob','p','r','n','base_mean','base_variance','target_mean','target_std']:
+        #                 if key in dist_params:
+        #                     try:
+        #                         row[f'param_{key}'] = float(dist_params[key])
+        #                     except Exception:
+        #                         row[f'param_{key}'] = dist_params[key]
+        #             summary_rows.append(row)
+        #         summary_df = pd.DataFrame(summary_rows)
+        #         summary_path = os.path.join(out_dir, f"{team1_id}_vs_{team2_id}_summary.csv")
+        #         summary_df.to_csv(summary_path, index=False)
+        #         print(f"GPP summary CSV written: {summary_path}")
+        #     except Exception as e:
+        #         print(f"Failed to write GPP summary CSV: {e}")
+        # except Exception as e:
+        #     print(f"Failed to create GPP plots/summary for {team1_id}@{team2_id}: {e}")
+
         return temp_fpts_dict
     
     @staticmethod
@@ -1633,13 +2110,20 @@ class NFL_GPP_Simulator:
                     self.teams_dict[m[1]],
                     self.num_iterations,
                     self.roster_construction,
+                    self.correlations_yaml_index,
+                    self.correlations_npz,
+                    self.distributions_df,
                 )
             )
         with mp.Pool() as pool:
             results = pool.starmap(self.run_simulation_for_game, game_simulation_params)
 
         for res in results:
-            temp_fpts_dict.update(res)
+            if isinstance(res, tuple) and len(res) == 2:
+                dct, _rows = res
+                temp_fpts_dict.update(dct)
+            else:
+                temp_fpts_dict.update(res)
 
         # generate arrays for every sim result for each player in the lineup and sum
         fpts_array = np.zeros(shape=(len(self.field_lineups), self.num_iterations))
@@ -1654,11 +2138,18 @@ class NFL_GPP_Simulator:
 
         for index, values in self.field_lineups.items():
             try:
-                fpts_sim = sum([temp_fpts_dict[player_id] for player_id in values["Lineup"].values()])
+                lineup_container = values["Lineup"]
+                if isinstance(lineup_container, dict):
+                    lineup_ids = list(lineup_container.values())
+                else:
+                    lineup_ids = list(lineup_container)
+                fpts_sim = sum([temp_fpts_dict[player_id] for player_id in lineup_ids])
             except KeyError:
-                for player_id in values["Lineup"].values():
-                    if player_id not in temp_fpts_dict.keys():
-                        print(player_id)
+                for player_id in lineup_ids:
+                    if player_id not in temp_fpts_dict:
+                        print(f"Missing player in sim dict: {player_id}")
+                # Fallback: fill zeros if missing to avoid crash
+                fpts_sim = sum([temp_fpts_dict.get(player_id, 0.0) for player_id in lineup_ids])
             fpts_array[index] = fpts_sim
 
         fpts_array = fpts_array.astype(np.float16)
@@ -1756,14 +2247,60 @@ class NFL_GPP_Simulator:
             def_opps = []
             simDupes = x['Count']
 
-            for position, player_id in x["Lineup"].items():
+            # Normalize lineup to a dict keyed by roster positions for consistent output
+            lineup_container = x["Lineup"]
+            if isinstance(lineup_container, dict):
+                lineup_map = dict(lineup_container)
+            else:
+                id_to_player = {v["ID"]: v for v in self.player_dict.values()}
+                lineup_map = {}
+                rb_slots = ["RB1", "RB2"]
+                wr_slots = ["WR1", "WR2", "WR3"]
+                rb_i = 0
+                wr_i = 0
+                te_set = False
+                flex_candidates = []
+                for pid in lineup_container:
+                    pinfo = id_to_player.get(pid)
+                    if not pinfo:
+                        continue
+                    poslist = pinfo.get("Position", [])
+                    if "DST" in poslist and "DST" not in lineup_map:
+                        lineup_map["DST"] = pid
+                        continue
+                    if "QB" in poslist and "QB" not in lineup_map:
+                        lineup_map["QB"] = pid
+                        continue
+                    if "RB" in poslist and rb_i < 2:
+                        lineup_map[rb_slots[rb_i]] = pid
+                        rb_i += 1
+                        continue
+                    if "WR" in poslist and wr_i < 3:
+                        lineup_map[wr_slots[wr_i]] = pid
+                        wr_i += 1
+                        continue
+                    if "TE" in poslist and not te_set:
+                        lineup_map["TE"] = pid
+                        te_set = True
+                        continue
+                    flex_candidates.append(pid)
+                if "FLEX" not in lineup_map:
+                    remaining = [pid for pid in lineup_container if pid not in lineup_map.values()]
+                    lineup_map["FLEX"] = flex_candidates[0] if len(flex_candidates) > 0 else (remaining[0] if len(remaining) > 0 else None)
+
+            # Accumulate stats and ordered names by roster positions
+            name_map = {}
+            for position in self.roster_positions:
+                player_id = lineup_map.get(position)
+                if not player_id:
+                    continue
                 player = next((v for v in self.player_dict.values() if v["ID"] == player_id), None)
                 if player:
+                    name_map[position] = player["Name"]
                     if "DST" in player["Position"]:
                         def_opps.append(player["Opp"])
                     if "QB" in player["Position"]:
                         qb_tm = player["Team"]
-                    
                     salary += player["Salary"]
                     fpts_p += player["Fpts"]
                     fieldFpts_p += player["fieldFpts"]
@@ -1798,29 +2335,29 @@ class NFL_GPP_Simulator:
                     roi_p = round(x["ROI"] / self.entry_fee / self.num_iterations * 100, 2)
                     roi_round = round(x["ROI"] / x['Count'] / self.num_iterations, 2)
                     lineup_str = "{} ({}),{} ({}),{} ({}),{} ({}),{} ({}),{} ({}),{} ({}),{} ({}),{} ({}),{},{},{},${},{}%,{}%,{}%,{},${},{},{},{},{},{}".format(
-                        lu_names[self.roster_positions.index('QB')].replace("#", "-"), x["Lineup"]['QB'],
-                        lu_names[self.roster_positions.index('RB1')].replace("#", "-"), x["Lineup"]['RB1'],
-                        lu_names[self.roster_positions.index('RB2')].replace("#", "-"), x["Lineup"]['RB2'],
-                        lu_names[self.roster_positions.index('WR1')].replace("#", "-"), x["Lineup"]['WR1'],
-                        lu_names[self.roster_positions.index('WR2')].replace("#", "-"), x["Lineup"]['WR2'],
-                        lu_names[self.roster_positions.index('WR3')].replace("#", "-"), x["Lineup"]['WR3'],
-                        lu_names[self.roster_positions.index('TE')].replace("#", "-"), x["Lineup"]['TE'],
-                        lu_names[self.roster_positions.index('FLEX')].replace("#", "-"), x["Lineup"]['FLEX'],
-                        lu_names[self.roster_positions.index('DST')].replace("#", "-"), x["Lineup"]['DST'],
+                        (name_map.get('QB','') or '').replace("#", "-"), lineup_map.get('QB', ''),
+                        (name_map.get('RB1','') or '').replace("#", "-"), lineup_map.get('RB1', ''),
+                        (name_map.get('RB2','') or '').replace("#", "-"), lineup_map.get('RB2', ''),
+                        (name_map.get('WR1','') or '').replace("#", "-"), lineup_map.get('WR1', ''),
+                        (name_map.get('WR2','') or '').replace("#", "-"), lineup_map.get('WR2', ''),
+                        (name_map.get('WR3','') or '').replace("#", "-"), lineup_map.get('WR3', ''),
+                        (name_map.get('TE','') or '').replace("#", "-"), lineup_map.get('TE', ''),
+                        (name_map.get('FLEX','') or '').replace("#", "-"), lineup_map.get('FLEX', ''),
+                        (name_map.get('DST','') or '').replace("#", "-"), lineup_map.get('DST', ''),
                         fpts_p, fieldFpts_p, ceil_p, salary, win_p, top10_p, roi_p, own_p, roi_round,
                         primaryStack, secondaryStack, players_vs_def, lu_type, simDupes
                     )
                 else:
                     lineup_str = "{} ({}),{} ({}),{} ({}),{} ({}),{} ({}),{} ({}),{} ({}),{} ({}),{} ({}),{},{},{},{},{}%,{}%,{}%,{},{},{},{},{}".format(
-                        lu_names[self.roster_positions.index('QB')].replace("#", "-"), x["Lineup"]['QB'],
-                        lu_names[self.roster_positions.index('RB1')].replace("#", "-"), x["Lineup"]['RB1'],
-                        lu_names[self.roster_positions.index('RB2')].replace("#", "-"), x["Lineup"]['RB2'],
-                        lu_names[self.roster_positions.index('WR1')].replace("#", "-"), x["Lineup"]['WR1'],
-                        lu_names[self.roster_positions.index('WR2')].replace("#", "-"), x["Lineup"]['WR2'],
-                        lu_names[self.roster_positions.index('WR3')].replace("#", "-"), x["Lineup"]['WR3'],
-                        lu_names[self.roster_positions.index('TE')].replace("#", "-"), x["Lineup"]['TE'],
-                        lu_names[self.roster_positions.index('FLEX')].replace("#", "-"), x["Lineup"]['FLEX'],
-                        lu_names[self.roster_positions.index('DST')].replace("#", "-"), x["Lineup"]['DST'],
+                        (name_map.get('QB','') or '').replace("#", "-"), lineup_map.get('QB', ''),
+                        (name_map.get('RB1','') or '').replace("#", "-"), lineup_map.get('RB1', ''),
+                        (name_map.get('RB2','') or '').replace("#", "-"), lineup_map.get('RB2', ''),
+                        (name_map.get('WR1','') or '').replace("#", "-"), lineup_map.get('WR1', ''),
+                        (name_map.get('WR2','') or '').replace("#", "-"), lineup_map.get('WR2', ''),
+                        (name_map.get('WR3','') or '').replace("#", "-"), lineup_map.get('WR3', ''),
+                        (name_map.get('TE','') or '').replace("#", "-"), lineup_map.get('TE', ''),
+                        (name_map.get('FLEX','') or '').replace("#", "-"), lineup_map.get('FLEX', ''),
+                        (name_map.get('DST','') or '').replace("#", "-"), lineup_map.get('DST', ''),
                         fpts_p, fieldFpts_p, ceil_p, salary, win_p, top10_p, own_p,
                         primaryStack, secondaryStack, players_vs_def, lu_type, simDupes
                     )
@@ -1831,15 +2368,15 @@ class NFL_GPP_Simulator:
                     )
                     roi_round = round(x["ROI"] / x['Count'] / self.num_iterations, 2)
                     lineup_str = "{}:{},{}:{},{}:{},{}:{},{}:{},{}:{},{}:{},{}:{},{}:{},{},{},{},{},{}%,{}%,{}%,{},${},{},{},{},{},{}".format(
-                        lu_names[self.roster_positions.index('QB')].replace("#", "-"), x["Lineup"]['QB'],
-                        lu_names[self.roster_positions.index('RB1')].replace("#", "-"), x["Lineup"]['RB1'],
-                        lu_names[self.roster_positions.index('RB2')].replace("#", "-"), x["Lineup"]['RB2'],
-                        lu_names[self.roster_positions.index('WR1')].replace("#", "-"), x["Lineup"]['WR1'],
-                        lu_names[self.roster_positions.index('WR2')].replace("#", "-"), x["Lineup"]['WR2'],
-                        lu_names[self.roster_positions.index('WR3')].replace("#", "-"), x["Lineup"]['WR3'],
-                        lu_names[self.roster_positions.index('TE')].replace("#", "-"), x["Lineup"]['TE'],
-                        lu_names[self.roster_positions.index('FLEX')].replace("#", "-"), x["Lineup"]['FLEX'],
-                        lu_names[self.roster_positions.index('DST')].replace("#", "-"), x["Lineup"]['DST'],
+                        lineup_map.get('QB', ''), (name_map.get('QB','') or '').replace("#", "-"),
+                        lineup_map.get('RB1', ''), (name_map.get('RB1','') or '').replace("#", "-"),
+                        lineup_map.get('RB2', ''), (name_map.get('RB2','') or '').replace("#", "-"),
+                        lineup_map.get('WR1', ''), (name_map.get('WR1','') or '').replace("#", "-"),
+                        lineup_map.get('WR2', ''), (name_map.get('WR2','') or '').replace("#", "-"),
+                        lineup_map.get('WR3', ''), (name_map.get('WR3','') or '').replace("#", "-"),
+                        lineup_map.get('TE', ''), (name_map.get('TE','') or '').replace("#", "-"),
+                        lineup_map.get('FLEX', ''), (name_map.get('FLEX','') or '').replace("#", "-"),
+                        lineup_map.get('DST', ''), (name_map.get('DST','') or '').replace("#", "-"),
                         fpts_p,
                         fieldFpts_p,
                         ceil_p,
@@ -1857,15 +2394,15 @@ class NFL_GPP_Simulator:
                     )
                 else:
                     lineup_str = "{}:{},{}:{},{}:{},{}:{},{}:{},{}:{},{}:{},{}:{},{}:{},{},{},{},{},{}%,{}%,{},{},{},{},{},{}".format(
-                        lu_names[self.roster_positions.index('QB')].replace("#", "-"), x["Lineup"]['QB'],
-                        lu_names[self.roster_positions.index('RB1')].replace("#", "-"), x["Lineup"]['RB1'],
-                        lu_names[self.roster_positions.index('RB2')].replace("#", "-"), x["Lineup"]['RB2'],
-                        lu_names[self.roster_positions.index('WR1')].replace("#", "-"), x["Lineup"]['WR1'],
-                        lu_names[self.roster_positions.index('WR2')].replace("#", "-"), x["Lineup"]['WR2'],
-                        lu_names[self.roster_positions.index('WR3')].replace("#", "-"), x["Lineup"]['WR3'],
-                        lu_names[self.roster_positions.index('TE')].replace("#", "-"), x["Lineup"]['TE'],
-                        lu_names[self.roster_positions.index('FLEX')].replace("#", "-"), x["Lineup"]['FLEX'],
-                        lu_names[self.roster_positions.index('DST')].replace("#", "-"), x["Lineup"]['DST'],
+                        lineup_map.get('QB', ''), (name_map.get('QB','') or '').replace("#", "-"),
+                        lineup_map.get('RB1', ''), (name_map.get('RB1','') or '').replace("#", "-"),
+                        lineup_map.get('RB2', ''), (name_map.get('RB2','') or '').replace("#", "-"),
+                        lineup_map.get('WR1', ''), (name_map.get('WR1','') or '').replace("#", "-"),
+                        lineup_map.get('WR2', ''), (name_map.get('WR2','') or '').replace("#", "-"),
+                        lineup_map.get('WR3', ''), (name_map.get('WR3','') or '').replace("#", "-"),
+                        lineup_map.get('TE', ''), (name_map.get('TE','') or '').replace("#", "-"),
+                        lineup_map.get('FLEX', ''), (name_map.get('FLEX','') or '').replace("#", "-"),
+                        lineup_map.get('DST', ''), (name_map.get('DST','') or '').replace("#", "-"),
                         fpts_p,
                         fieldFpts_p,
                         ceil_p,
@@ -1922,7 +2459,12 @@ class NFL_GPP_Simulator:
             )
             unique_players = {}
             for val in self.field_lineups.values():
-                for player in val["Lineup"].values():
+                lineup_container = val["Lineup"]
+                if isinstance(lineup_container, dict):
+                    iter_ids = lineup_container.values()
+                else:
+                    iter_ids = lineup_container
+                for player in iter_ids:
                     if player not in unique_players:
                         unique_players[player] = {
                             "Wins": val["Wins"],
