@@ -485,6 +485,11 @@ class NFL_Optimizer:
                                 ]:
                                     stack_players_tuples.append(key)
 
+                            if (
+                                pos_key_player_tuple is None
+                                or len(stack_players_tuples) == 0
+                            ):
+                                continue
                             # [sum of stackable players] + -n*[stack_player] >= 0
                             self.problem += (
                                 plp.lpSum(
@@ -533,6 +538,7 @@ class NFL_Optimizer:
                         opp_team = opp_team[0]["Opponent"]
                         if team in excluded_teams:
                             continue
+
                         limit_players = []
                         if stack_type == "same-team":
                             for pos in limit_positions:
@@ -566,6 +572,8 @@ class NFL_Optimizer:
                                 ]:
                                     limit_players_tuples.append(key)
 
+                            if len(limit_players_tuples) == 0:
+                                continue
                             self.problem += (
                                 plp.lpSum(
                                     [
@@ -593,17 +601,19 @@ class NFL_Optimizer:
                                     )
                             elif unless_type == "opp-team":
                                 for pos in unless_positions:
-                                    unless_players.append(
-                                        self.players_by_team[opp_team][pos]
-                                    )
+                                    if opp_team in self.players_by_team:
+                                        unless_players.append(
+                                            self.players_by_team[opp_team][pos]
+                                        )
                             elif unless_type == "same-game":
                                 for pos in unless_positions:
                                     unless_players.append(
                                         self.players_by_team[team][pos]
                                     )
-                                    unless_players.append(
-                                        self.players_by_team[opp_team][pos]
-                                    )
+                                    if opp_team in self.players_by_team:
+                                        unless_players.append(
+                                            self.players_by_team[opp_team][pos]
+                                        )
 
                             unless_players = self.flatten(unless_players)
 
@@ -642,7 +652,8 @@ class NFL_Optimizer:
                                     unless_players_tuples.append(key)
 
                             # [sum of limit players] + -count(unless_players)*[unless_players] <= n
-
+                            if len(limit_players_tuples) == 0:
+                                continue
                             self.problem += (
                                 plp.lpSum(
                                     [
